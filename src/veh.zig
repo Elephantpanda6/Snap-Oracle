@@ -1,5 +1,7 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const windows = std.os.windows;
+const coverage = @import("coverage.zig");
 
 const EXCEPTION_CONTINUE_SEARCH: c_long = 0;
 const EXCEPTION_EXECUTE_HANDLER: c_long = 1;
@@ -30,6 +32,7 @@ threadlocal var g_active: bool = false;
 threadlocal var g_caught: bool = false;
 threadlocal var g_exc_code: u32 = 0;
 threadlocal var g_exc_addr: usize = 0;
+threadlocal var g_bp_table: ?*coverage.BreakpointTable = null;
 threadlocal var g_return_ctx: [2048]u8 align(16) = undefined;
 
 pub const RunResult = struct {
@@ -39,7 +42,30 @@ pub const RunResult = struct {
     ret_val: u64,
 };
 
+/// Install (or clear with null) the one-shot breakpoint table consulted for `0x80000003` hits
+/// on the current thread.
+pub fn setBreakpointTable(bp: ?*coverage.BreakpointTable) void {
+    g_bp_table = bp;
+}
+
+/// x64 `int3` traps report RIP = address+1; rewind so the restored instruction executes.
+/// (AArch64 `brk` reports PC at the faulting instruction already.)
+fn rewindToException(ep: *EXCEPTION_POINTERS) void {
+    if (builtin.cpu.arch == .x86_64) {
+        const rip: *align(1) u64 = @ptrFromInt(@intFromPtr(ep.ContextRecord) + 0xF8);
+        rip.* = @intFromPtr(ep.ExceptionRecord.ExceptionAddress);
+    }
+}
+
 fn vehHandler(ep: *EXCEPTION_POINTERS) callconv(.winapi) c_long {
+    if (ep.ExceptionRecord.ExceptionCode == 0x80000003) {
+        if (g_bp_table) |bp| {
+            if (bp.handleBreakpoint(@intFromPtr(ep.ExceptionRecord.ExceptionAddress))) {
+                rewindToException(ep);
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+        }
+    }
     if (!g_active) return EXCEPTION_CONTINUE_SEARCH;
 
     const code = ep.ExceptionRecord.ExceptionCode;

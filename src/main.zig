@@ -14,15 +14,22 @@ fn getFlag(args: []const []const u8, name: []const u8) ?[]const u8 {
     return null;
 }
 
+fn hasFlag(args: []const []const u8, name: []const u8) bool {
+    for (args) |a| {
+        if (std.mem.eql(u8, a, name)) return true;
+    }
+    return false;
+}
+
 fn printUsage() void {
     std.debug.print(
         \\snap-oracle (win-x64 / win-arm64) - Binary-Only Differential Snapshot Fuzzer
         \\
         \\Usage:
         \\  snap-oracle inspect <target.exe|dll>       Parse PE/.pdata functions, exports & basic blocks
-        \\  snap-oracle fuzz    --target <bin> --entry <fn> [--iters N]
+        \\  snap-oracle fuzz    --target <bin> --entry <fn> [--iters N] [--corpus <dir>]
         \\  snap-oracle diff    --x64 <bin> --arm64 <bin> --entry <fn>
-        \\  snap-oracle replay  --target <bin> --entry <fn> --input <file>
+        \\  snap-oracle replay  --target <bin> --entry <fn> --input <file> [--minimize]
         \\
     , .{});
 }
@@ -91,7 +98,8 @@ pub fn main(init: std.process.Init) !void {
         const entry = getFlag(args[2..], "--entry") orelse "fuzz_entry";
         const iters_str = getFlag(args[2..], "--iters") orelse "1000";
         const iters = std.fmt.parseInt(usize, iters_str, 10) catch 1000;
-        try runner.runFuzz(init.io, allocator, target, entry, iters);
+        const corpus_dir = getFlag(args[2..], "--corpus");
+        try runner.runFuzz(init.io, allocator, target, entry, iters, corpus_dir);
     } else if (std.mem.eql(u8, sub, "diff")) {
         const x64_bin = getFlag(args[2..], "--x64") orelse {
             printUsage();
@@ -115,7 +123,8 @@ pub fn main(init: std.process.Init) !void {
             printUsage();
             return;
         };
-        try runner.runReplay(init.io, allocator, target, entry, input);
+        const minimize = hasFlag(args[2..], "--minimize");
+        try runner.runReplay(init.io, allocator, target, entry, input, minimize);
     } else {
         printUsage();
     }
