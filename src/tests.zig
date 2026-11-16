@@ -126,7 +126,7 @@ test "end-to-end decodeX64BasicBlocksFull + BreakpointTable + VEH one-shot cover
     veh.setBreakpointTable(&table);
     defer veh.setBreakpointTable(null);
 
-    const f: veh.TargetFn = @ptrCast(mem);
+    const f: veh.TargetFn = @ptrCast(@alignCast(mem));
     const long_in = "ABCD";
     const res1 = veh.runProtected(f, long_in.ptr, long_in.len);
     try std.testing.expect(!res1.crashed);
@@ -228,7 +228,7 @@ test "end-to-end decodeArm64BasicBlocks + BreakpointTable + VEH one-shot coverag
     veh.setBreakpointTable(&table);
     defer veh.setBreakpointTable(null);
 
-    const f: veh.TargetFn = @ptrCast(mem);
+    const f: veh.TargetFn = @ptrCast(@alignCast(mem));
     const long_in = "ABCD";
     const res1 = veh.runProtected(f, long_in.ptr, long_in.len);
     try std.testing.expect(!res1.crashed);
