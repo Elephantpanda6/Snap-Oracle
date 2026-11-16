@@ -42,6 +42,15 @@ pub const LoadedTarget = struct {
 };
 
 extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
+extern "kernel32" fn QueryPerformanceCounter(lpPerformanceCount: *i64) callconv(.winapi) i32;
+
+fn prngSeed(salt: u64) u64 {
+    var qpc: i64 = 0;
+    if (QueryPerformanceCounter(&qpc) != 0) {
+        return @as(u64, @bitCast(qpc)) ^ GetTickCount64() ^ salt;
+    }
+    return GetTickCount64() ^ salt;
+}
 
 pub fn runFuzz(
     io: std.Io,
@@ -78,7 +87,7 @@ pub fn runFuzz(
     @memset(arena.live_ptr[0..max_input], 0x41);
     arena.takeSnapshot();
 
-    var rng = mutator.Rng.init(arch.readCycleCounter() ^ 0x517cc1b727220a95);
+    var rng = mutator.Rng.init(prngSeed(0x517cc1b727220a95));
 
     var corp = corpus.Corpus.init(allocator);
     defer corp.deinit();
@@ -184,7 +193,7 @@ pub fn runDiff(
     var guard = veh.Guard.init();
     defer guard.deinit();
 
-    var rng = mutator.Rng.init(arch.readCycleCounter() ^ 0x9e3779b97f4a7c15);
+    var rng = mutator.Rng.init(prngSeed(0x9e3779b97f4a7c15));
     var buf: [256]u8 = @splat(0x41);
     var divergences: usize = 0;
 

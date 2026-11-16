@@ -62,11 +62,15 @@ jobs:
         shell: pwsh
         run: |
           .\zig-out\bin\snap-oracle.exe inspect .\zig-out\bin\test_target.dll
+          if ($LASTEXITCODE -ne 0) { throw "inspect failed with $LASTEXITCODE" }
           .\zig-out\bin\snap-oracle.exe fuzz --target .\zig-out\bin\test_target.dll --entry fuzz_entry --iters 100000
+          if ($LASTEXITCODE -ne 0) { throw "fuzz_entry failed with $LASTEXITCODE" }
           $crash = Get-ChildItem -Filter "crash_*.bin" | Select-Object -First 1
           if (-not $crash) { throw "Expected crash artifact from fuzz_entry" }
           .\zig-out\bin\snap-oracle.exe replay --target .\zig-out\bin\test_target.dll --entry fuzz_entry --input $crash.FullName --minimize
+          if ($LASTEXITCODE -ne 0) { throw "replay failed with $LASTEXITCODE" }
           $minBytes = [System.IO.File]::ReadAllBytes($crash.FullName + ".min")
           Write-Output ("MINIMIZED_HEX=" + [System.BitConverter]::ToString($minBytes))
           New-Item -ItemType Directory -Force -Path corp | Out-Null
           .\zig-out\bin\snap-oracle.exe fuzz --target .\zig-out\bin\test_target.dll --entry parse_packet --iters 1000000 --corpus corp
+          if ($LASTEXITCODE -ne 0) { throw "parse_packet fuzz failed with $LASTEXITCODE" }

@@ -468,11 +468,6 @@ pub fn decodeAllTextBasicBlocks(allocator: std.mem.Allocator, bytes: []const u8)
     const text_begin = text.virtual_address;
     const text_end = text_begin + @min(span, @as(u32, @intCast(avail)));
 
-    switch (img.machine) {
-        .arm64, .arm64ec => return decodeArm64BasicBlocks(allocator, code, text_begin, text_begin, text_end),
-        else => {},
-    }
-
     var seen = std.AutoHashMap(u32, void).init(allocator);
     defer seen.deinit();
     var out = std.ArrayList(BasicBlock).empty;
@@ -481,7 +476,11 @@ pub fn decodeAllTextBasicBlocks(allocator: std.mem.Allocator, bytes: []const u8)
     for (img.functions) |f| {
         if (f.end_rva <= f.begin_rva) continue;
         if (f.begin_rva < text_begin or f.end_rva > text_end) continue;
-        const bbs = try decodeX64BasicBlocksFull(allocator, code, text_begin, f.begin_rva, f.end_rva);
+        const bbs = switch (img.machine) {
+            .arm64, .arm64ec => try decodeArm64BasicBlocks(allocator, code, text_begin, f.begin_rva, f.end_rva),
+            .amd64 => try decodeX64BasicBlocksFull(allocator, code, text_begin, f.begin_rva, f.end_rva),
+            else => continue,
+        };
         defer allocator.free(bbs);
         for (bbs) |bb| {
             if (seen.contains(bb.rva)) continue;
@@ -558,9 +557,10 @@ test "x64 basic blocks: targets, fall-throughs, no decoding of dead data" {
     try std.testing.expectEqual(@as(usize, 3), targets.len);
 }
 
-test "x64 decodeAllTextBasicBlocks on this test executable" {
+test "decodeAllTextBasicBlocks on kernel32.dll" {
     const alloc = std.testing.allocator;
-    if (@import("builtin").cpu.arch != .x86_64 or @import("builtin").os.tag != .windows) return error.SkipZigTest;
+    const arch = @import("builtin").cpu.arch;
+    if ((arch != .x86_64 and arch != .aarch64) or @import("builtin").os.tag != .windows) return error.SkipZigTest;
     // Parse a system DLL image from disk (kernel32 is always present).
     var buf: [64]u8 = undefined;
     _ = &buf;

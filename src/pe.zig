@@ -148,20 +148,49 @@ pub fn parsePe(allocator: std.mem.Allocator, bytes: []const u8) !PeImage {
     if (num_rvas > 3 and opt_off + 112 + 4 * 8 <= bytes.len) {
         const pdata_rva = try readU32(bytes, opt_off + 112 + 3 * 8);
         const pdata_size = try readU32(bytes, opt_off + 112 + 3 * 8 + 4);
-        if (pdata_rva != 0 and pdata_size >= 12) {
+        if (pdata_rva != 0) {
             if (img.rvaToOffset(pdata_rva)) |pdata_off| {
                 const max_avail = @min(@as(usize, pdata_size), bytes.len - pdata_off);
-                const count = max_avail / 12;
-                var funcs = try allocator.alloc(RuntimeFunction, count);
-                for (0..count) |i| {
-                    const f_off = pdata_off + i * 12;
-                    funcs[i] = .{
-                        .begin_rva = try readU32(bytes, f_off),
-                        .end_rva = try readU32(bytes, f_off + 4),
-                        .unwind_rva = try readU32(bytes, f_off + 8),
-                    };
+                if (machine == .arm64 or machine == .arm64ec) {
+                    const count = max_avail / 8;
+                    var funcs = try allocator.alloc(RuntimeFunction, count);
+                    var valid: usize = 0;
+                    for (0..count) |i| {
+                        const f_off = pdata_off + i * 8;
+                        const begin_rva = try readU32(bytes, f_off);
+                        const unwind_data = try readU32(bytes, f_off + 4);
+                        if (begin_rva == 0 and unwind_data == 0) continue;
+                        const flag = unwind_data & 0x3;
+                        const fn_len_bytes: u32 = if (flag != 0)
+                            ((unwind_data >> 2) & 0x7FF) * 4
+                        else blk: {
+                            const xdata_rva = unwind_data & 0xFFFF_FFFC;
+                            const x_off = img.rvaToOffset(xdata_rva) orelse break :blk 0;
+                            const hdr = readU32(bytes, x_off) catch break :blk 0;
+                            break :blk (hdr & 0x3FFFF) * 4;
+                        };
+                        if (fn_len_bytes == 0) continue;
+                        funcs[valid] = .{
+                            .begin_rva = begin_rva,
+                            .end_rva = begin_rva +| fn_len_bytes,
+                            .unwind_rva = unwind_data,
+                        };
+                        valid += 1;
+                    }
+                    img.functions = try allocator.realloc(funcs, valid);
+                } else if (pdata_size >= 12) {
+                    const count = max_avail / 12;
+                    var funcs = try allocator.alloc(RuntimeFunction, count);
+                    for (0..count) |i| {
+                        const f_off = pdata_off + i * 12;
+                        funcs[i] = .{
+                            .begin_rva = try readU32(bytes, f_off),
+                            .end_rva = try readU32(bytes, f_off + 4),
+                            .unwind_rva = try readU32(bytes, f_off + 8),
+                        };
+                    }
+                    img.functions = funcs;
                 }
-                img.functions = funcs;
             }
         }
     }

@@ -189,3 +189,55 @@ test "end-to-end minimizeCrash shrinks padded trigger to BOOM" {
     defer std.testing.allocator.free(out);
     try std.testing.expectEqualStrings("BOOM", out);
 }
+
+test "end-to-end decodeArm64BasicBlocks + BreakpointTable + VEH one-shot coverage" {
+    if (builtin.cpu.arch != .aarch64 or builtin.os.tag != .windows) return error.SkipZigTest;
+
+    const mem: [*]u8 = @ptrCast(VirtualAlloc(null, 4096, MEM_RESERVE_TEST | MEM_COMMIT_TEST, PAGE_EXECUTE_READWRITE_TEST) orelse return error.SkipZigTest);
+    defer _ = VirtualFree(mem, 0, MEM_RELEASE_TEST);
+
+    // ARM64 ABI (x0=ptr, x1=len):
+    // 0x00: cmp x1, #4       (F100103F)
+    // 0x04: b.lo +12 -> 0x10 (54000063)
+    // 0x08: movz w0, #1      (52800020)
+    // 0x0C: ret              (D65F03C0)
+    // 0x10: movz w0, #0      (52800000)
+    // 0x14: ret              (D65F03C0)
+    const code = [_]u8{
+        0x3F, 0x10, 0x00, 0xF1,
+        0x63, 0x00, 0x00, 0x54,
+        0x20, 0x00, 0x80, 0x52,
+        0xC0, 0x03, 0x5F, 0xD6,
+        0x00, 0x00, 0x80, 0x52,
+        0xC0, 0x03, 0x5F, 0xD6,
+    };
+    @memcpy(mem[0..code.len], &code);
+    l1.flushCodeRange(mem, code.len);
+
+    const blocks = try cfg.decodeArm64BasicBlocks(std.testing.allocator, mem[0..code.len], 0, 0, code.len);
+    defer std.testing.allocator.free(blocks);
+    try std.testing.expectEqual(@as(usize, 3), blocks.len);
+
+    var bitmap = l1.CoverageBitmap{};
+    var table = try coverage.BreakpointTable.init(std.testing.allocator, @intFromPtr(mem), .arm64, blocks, &bitmap);
+    defer table.deinit();
+    try std.testing.expectEqual(@as(usize, 3), table.totalCount());
+
+    var guard = veh.Guard.init();
+    defer guard.deinit();
+    veh.setBreakpointTable(&table);
+    defer veh.setBreakpointTable(null);
+
+    const f: veh.TargetFn = @ptrCast(mem);
+    const long_in = "ABCD";
+    const res1 = veh.runProtected(f, long_in.ptr, long_in.len);
+    try std.testing.expect(!res1.crashed);
+    try std.testing.expectEqual(@as(u64, 1), res1.ret_val);
+    try std.testing.expectEqual(@as(usize, 2), table.hitCount());
+
+    const short_in = "A";
+    const res2 = veh.runProtected(f, short_in.ptr, short_in.len);
+    try std.testing.expect(!res2.crashed);
+    try std.testing.expectEqual(@as(u64, 0), res2.ret_val);
+    try std.testing.expectEqual(@as(usize, 3), table.hitCount());
+}

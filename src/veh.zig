@@ -48,12 +48,17 @@ pub fn setBreakpointTable(bp: ?*coverage.BreakpointTable) void {
     g_bp_table = bp;
 }
 
-/// x64 `int3` traps report RIP = address+1; rewind so the restored instruction executes.
-/// (AArch64 `brk` reports PC at the faulting instruction already.)
+/// x64 `int3` traps report RIP = address+1, and Windows ARM64 `brk #0xF000` may report
+/// PC = address or address+4; explicitly restore IP/PC to `ExceptionAddress` so the
+/// restored original instruction executes cleanly on both architectures.
 fn rewindToException(ep: *EXCEPTION_POINTERS) void {
     if (builtin.cpu.arch == .x86_64) {
         const rip: *align(1) u64 = @ptrFromInt(@intFromPtr(ep.ContextRecord) + 0xF8);
         rip.* = @intFromPtr(ep.ExceptionRecord.ExceptionAddress);
+    } else if (builtin.cpu.arch == .aarch64) {
+        // `_ARM64_NT_CONTEXT::Pc` is at offset 0x108 in `winnt.h`.
+        const pc: *align(1) u64 = @ptrFromInt(@intFromPtr(ep.ContextRecord) + 0x108);
+        pc.* = @intFromPtr(ep.ExceptionRecord.ExceptionAddress);
     }
 }
 

@@ -1,7 +1,8 @@
 const builtin = @import("builtin");
 
 pub const X64_INT3: u8 = 0xCC;
-pub const ARM64_BRK_0: u32 = 0xD420_0000;
+/// Canonical Windows on ARM64 breakpoint (`brk #0xF000` -> `STATUS_BREAKPOINT` 0x80000003).
+pub const ARM64_BRK_0: u32 = 0xD43E_0000;
 
 /// Cycle-exact hardware timestamp counter.
 pub inline fn readCycleCounter() u64 {
@@ -31,23 +32,10 @@ pub inline fn stripPac(addr: u64) u64 {
 }
 
 /// Flush instruction cache after patching/restoring a breakpoint.
-pub inline fn flushIcacheAddr(addr: usize) void {
-    switch (builtin.cpu.arch) {
-        .aarch64 => {
-            asm volatile (
-                \\dc cvau, %[a]
-                \\dsb ish
-                \\ic ivau, %[a]
-                \\dsb ish
-                \\isb
-                :
-                : [a] "r" (addr),
-                : .{ .memory = true }
-            );
-        },
-        else => {},
-    }
-}
+/// On Windows, `l1.flushCodeRange` calls `FlushInstructionCache(GetCurrentProcess(), ...)`,
+/// which performs safe kernel-coordinated D-cache/I-cache coherency even in VMs where
+/// EL0 `dc cvau` / `ic ivau` (`SCTLR_EL1.UCI == 0`) is trapped.
+pub inline fn flushIcacheAddr(_: usize) void {}
 
 /// Fast 4KB page restore from clean snapshot to dirty target page.
 pub fn fastRestorePage4K(dst: [*]u8, src: [*]const u8) void {
