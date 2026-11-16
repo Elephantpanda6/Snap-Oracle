@@ -1,0 +1,72 @@
+name: Snap-Oracle Dual-Arch Windows CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  win-x64-and-arm64-cross:
+    name: Windows x64 Suite & ARM64 Cross-Compile
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig 0.17.1
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+
+      - name: Run Native x64 Unit Tests
+        run: zig build test --summary all
+
+      - name: Build Native x64 ReleaseFast & Cross-Compile ARM64
+        shell: pwsh
+        run: |
+          zig build -Doptimize=ReleaseFast
+          .\zig-out\bin\snap-oracle.exe inspect .\zig-out\bin\test_target.dll
+          zig build -Dtarget=aarch64-windows-gnu -Doptimize=ReleaseFast
+          $b = [System.IO.File]::ReadAllBytes("zig-out\bin\snap-oracle.exe")
+          $pe = [BitConverter]::ToInt32($b, 0x3C)
+          $m = [BitConverter]::ToUInt16($b, $pe + 4)
+          Write-Output ("CROSS_PE_MACHINE=0x" + $m.ToString("X4"))
+          if ($m -ne 0xAA64) { throw "Expected 0xAA64 ARM64 PE machine, got 0x$($m.ToString('X4'))" }
+
+  win-arm64-native:
+    name: Native Windows on ARM64 Verification
+    runs-on: windows-11-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig 0.17.1
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+
+      - name: Run Native ARM64 Unit Tests
+        run: zig build test --summary all
+
+      - name: Build Native ARM64 ReleaseFast & Verify PE Header
+        shell: pwsh
+        run: |
+          zig build -Doptimize=ReleaseFast
+          $b = [System.IO.File]::ReadAllBytes("zig-out\bin\snap-oracle.exe")
+          $pe = [BitConverter]::ToInt32($b, 0x3C)
+          $m = [BitConverter]::ToUInt16($b, $pe + 4)
+          Write-Output ("NATIVE_ARM64_MACHINE=0x" + $m.ToString("X4"))
+          if ($m -ne 0xAA64) { throw "Expected 0xAA64 ARM64 PE machine, got 0x$($m.ToString('X4'))" }
+
+      - name: Run Live Native ARM64 Inspect, Fuzz, Coverage Corpus & Crash Minimizer
+        shell: pwsh
+        run: |
+          .\zig-out\bin\snap-oracle.exe inspect .\zig-out\bin\test_target.dll
+          .\zig-out\bin\snap-oracle.exe fuzz --target .\zig-out\bin\test_target.dll --entry fuzz_entry --iters 100000
+          $crash = Get-ChildItem -Filter "crash_*.bin" | Select-Object -First 1
+          if (-not $crash) { throw "Expected crash artifact from fuzz_entry" }
+          .\zig-out\bin\snap-oracle.exe replay --target .\zig-out\bin\test_target.dll --entry fuzz_entry --input $crash.FullName --minimize
+          $minBytes = [System.IO.File]::ReadAllBytes($crash.FullName + ".min")
+          Write-Output ("MINIMIZED_HEX=" + [System.BitConverter]::ToString($minBytes))
+          New-Item -ItemType Directory -Force -Path corp | Out-Null
+          .\zig-out\bin\snap-oracle.exe fuzz --target .\zig-out\bin\test_target.dll --entry parse_packet --iters 1000000 --corpus corp
