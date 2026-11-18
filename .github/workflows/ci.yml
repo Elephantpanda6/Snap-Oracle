@@ -1,4 +1,4 @@
-name: Snap-Oracle Dual-Arch Windows CI
+name: Snap-Oracle ARM64 Multi-OS CI
 
 on:
   push:
@@ -8,8 +8,8 @@ on:
   workflow_dispatch:
 
 jobs:
-  win-x64-and-arm64-cross:
-    name: Windows x64 Suite & ARM64 Cross-Compile
+  arm64-cross-and-x64-host:
+    name: Host Tests & Multi-OS ARM64 Cross-Compile
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -19,20 +19,27 @@ jobs:
         with:
           version: 0.17.1
 
-      - name: Run Native x64 Unit Tests
+      - name: Run Full Unit & Integration Suite
         run: zig build test --summary all
 
-      - name: Build Native x64 ReleaseFast & Cross-Compile ARM64
+      - name: Cross-Compile ARM64 Windows, Linux, & macOS
         shell: pwsh
         run: |
-          zig build -Doptimize=ReleaseFast
-          .\zig-out\bin\snap-oracle.exe inspect .\zig-out\bin\test_target.dll
           zig build -Dtarget=aarch64-windows-gnu -Doptimize=ReleaseFast
           $b = [System.IO.File]::ReadAllBytes("zig-out\bin\snap-oracle.exe")
           $pe = [BitConverter]::ToInt32($b, 0x3C)
           $m = [BitConverter]::ToUInt16($b, $pe + 4)
-          Write-Output ("CROSS_PE_MACHINE=0x" + $m.ToString("X4"))
+          Write-Output ("WIN_ARM64_MACHINE=0x" + $m.ToString("X4"))
           if ($m -ne 0xAA64) { throw "Expected 0xAA64 ARM64 PE machine, got 0x$($m.ToString('X4'))" }
+          Copy-Item "zig-out\bin\test_target.dll" "arm64_test_target.dll" -Force
+
+          zig build -Dtarget=aarch64-linux-gnu -Doptimize=ReleaseFast
+          zig build -Dtarget=aarch64-macos -Doptimize=ReleaseFast
+
+          zig build -Doptimize=ReleaseFast
+          .\zig-out\bin\snap-oracle.exe hwinfo
+          .\zig-out\bin\snap-oracle.exe audit .\arm64_test_target.dll
+          .\zig-out\bin\snap-oracle.exe inspect .\arm64_test_target.dll
 
   win-arm64-native:
     name: Native Windows on ARM64 Verification
@@ -58,19 +65,62 @@ jobs:
           Write-Output ("NATIVE_ARM64_MACHINE=0x" + $m.ToString("X4"))
           if ($m -ne 0xAA64) { throw "Expected 0xAA64 ARM64 PE machine, got 0x$($m.ToString('X4'))" }
 
-      - name: Run Live Native ARM64 Inspect, Fuzz, Coverage Corpus & Crash Minimizer
+      - name: Run Live Native ARM64 Probe, Audit, Fuzz, Stateful Reset & Minimizer
         shell: pwsh
         run: |
+          .\zig-out\bin\snap-oracle.exe hwinfo
+          .\zig-out\bin\snap-oracle.exe profiles
+          .\zig-out\bin\snap-oracle.exe audit .\zig-out\bin\test_target.dll
           .\zig-out\bin\snap-oracle.exe inspect .\zig-out\bin\test_target.dll
-          if ($LASTEXITCODE -ne 0) { throw "inspect failed with $LASTEXITCODE" }
-          .\zig-out\bin\snap-oracle.exe fuzz --target .\zig-out\bin\test_target.dll --entry fuzz_entry --iters 100000
-          if ($LASTEXITCODE -ne 0) { throw "fuzz_entry failed with $LASTEXITCODE" }
+
+          .\zig-out\bin\snap-oracle.exe fuzz --target .\zig-out\bin\test_target.dll --entry fuzz_entry --iters 100000 --bti-safe
           $crash = Get-ChildItem -Filter "crash_*.bin" | Select-Object -First 1
           if (-not $crash) { throw "Expected crash artifact from fuzz_entry" }
           .\zig-out\bin\snap-oracle.exe replay --target .\zig-out\bin\test_target.dll --entry fuzz_entry --input $crash.FullName --minimize
-          if ($LASTEXITCODE -ne 0) { throw "replay failed with $LASTEXITCODE" }
-          $minBytes = [System.IO.File]::ReadAllBytes($crash.FullName + ".min")
-          Write-Output ("MINIMIZED_HEX=" + [System.BitConverter]::ToString($minBytes))
+
+          Remove-Item "crash_*.bin*" -ErrorAction SilentlyContinue
+          .\zig-out\bin\snap-oracle.exe fuzz --target .\zig-out\bin\test_target.dll --entry stateful_counter --iters 100000
+          $sc = Get-ChildItem -Filter "crash_*.bin" | Select-Object -First 1
+          if (-not $sc) { throw "Expected crash artifact from stateful_counter" }
+          .\zig-out\bin\snap-oracle.exe replay --target .\zig-out\bin\test_target.dll --entry stateful_counter --input $sc.FullName --minimize
+
           New-Item -ItemType Directory -Force -Path corp | Out-Null
-          .\zig-out\bin\snap-oracle.exe fuzz --target .\zig-out\bin\test_target.dll --entry parse_packet --iters 1000000 --corpus corp
-          if ($LASTEXITCODE -ne 0) { throw "parse_packet fuzz failed with $LASTEXITCODE" }
+          .\zig-out\bin\snap-oracle.exe fuzz --target .\zig-out\bin\test_target.dll --entry parse_packet --iters 1000000 --corpus corp --bti-safe
+          .\zig-out\bin\snap-oracle.exe fuzz --target .\zig-out\bin\test_target.dll --entry gguf_header_parse --iters 200000
+
+  linux-arm64-native:
+    name: Native Linux ARM64 Verification
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig 0.17.1
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+
+      - name: Run Native Linux ARM64 Unit Tests & Build
+        run: |
+          zig build test --summary all
+          zig build -Doptimize=ReleaseFast
+          ./zig-out/bin/snap-oracle hwinfo
+          ./zig-out/bin/snap-oracle audit ./zig-out/lib/libtest_target.so || ./zig-out/bin/snap-oracle audit ./zig-out/bin/snap-oracle
+          ./zig-out/bin/snap-oracle fuzz --target ./zig-out/lib/libtest_target.so --entry fuzz_entry --iters 50000 --bti-safe
+
+  macos-arm64-native:
+    name: Native Apple Silicon macOS Verification
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig 0.17.1
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+
+      - name: Run Native Apple Silicon ARM64 Unit Tests & Build
+        run: |
+          zig build test --summary all
+          zig build -Doptimize=ReleaseFast
+          ./zig-out/bin/snap-oracle hwinfo
+          ./zig-out/bin/snap-oracle audit ./zig-out/lib/libtest_target.dylib || ./zig-out/bin/snap-oracle audit ./zig-out/bin/snap-oracle

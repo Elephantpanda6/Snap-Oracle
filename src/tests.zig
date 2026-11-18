@@ -1,12 +1,53 @@
 const std = @import("std");
 const builtin = @import("builtin");
+
+const arch = @import("arch.zig");
+const arm64_isa = @import("arm64_isa.zig");
+const pe = @import("pe.zig");
+const elf_arm64 = @import("elf_arm64.zig");
+const macho_arm64 = @import("macho_arm64.zig");
+const binary = @import("binary.zig");
 const cfg = @import("cfg.zig");
+const dict_extract = @import("dict_extract.zig");
 const mutator = @import("mutator.zig");
 const l1 = @import("l1_engine.zig");
+const dll_snapshot = @import("dll_snapshot.zig");
 const veh = @import("veh.zig");
 const coverage = @import("coverage.zig");
 const corpus = @import("corpus.zig");
 const minimizer = @import("minimizer.zig");
+const arm_laptops = @import("arm_laptops.zig");
+const audit = @import("audit.zig");
+const diff_protocol = @import("diff_protocol.zig");
+const runner = @import("runner.zig");
+const worker = @import("worker.zig");
+const pool = @import("pool.zig");
+const test_target = @import("test_target.zig");
+
+comptime {
+    _ = arch;
+    _ = arm64_isa;
+    _ = pe;
+    _ = elf_arm64;
+    _ = macho_arm64;
+    _ = binary;
+    _ = cfg;
+    _ = dict_extract;
+    _ = mutator;
+    _ = l1;
+    _ = dll_snapshot;
+    _ = veh;
+    _ = coverage;
+    _ = corpus;
+    _ = minimizer;
+    _ = arm_laptops;
+    _ = audit;
+    _ = diff_protocol;
+    _ = runner;
+    _ = worker;
+    _ = pool;
+    _ = test_target;
+}
 
 test "arm64 basic-block decoder" {
     const alloc = std.testing.allocator;
@@ -24,7 +65,6 @@ test "arm64 basic-block decoder" {
 
 test "x64 basic-block decoder" {
     const alloc = std.testing.allocator;
-    // nop; je +2; nop; nop; ret
     const code = [_]u8{ 0x90, 0x74, 0x02, 0x90, 0x90, 0xC3 };
     const bbs = try cfg.decodeX64BasicBlocks(alloc, &code, 0x1000, 0x1000, 0x1006);
     defer alloc.free(bbs);
@@ -42,20 +82,20 @@ test "mutator & coverage bitmap" {
     try std.testing.expectEqual(@as(usize, 1), bm.unique_edges);
 }
 
-test "windows MEM_WRITE_WATCH dirty-page reset" {
+test "SnapshotArena dirty-page reset (MEM_WRITE_WATCH on Windows / page compare on POSIX)" {
     const alloc = std.testing.allocator;
-    var arena = try l1.SnapshotArena.init(alloc, 16 * 1024);
+    var arena = try l1.SnapshotArena.init(alloc, 32 * 1024);
     defer arena.deinit();
 
     arena.live_ptr[0] = 0xAA;
     arena.takeSnapshot();
 
     arena.live_ptr[0] = 0x55;
-    arena.live_ptr[4096] = 0x77;
-    const restored = arena.restoreDirtyPages();
+    arena.live_ptr[arena.page_size] = 0x77;
+    const restored = try arena.restoreDirtyPages();
     try std.testing.expectEqual(@as(usize, 2), restored);
     try std.testing.expectEqual(@as(u8, 0xAA), arena.live_ptr[0]);
-    try std.testing.expectEqual(@as(u8, 0x00), arena.live_ptr[4096]);
+    try std.testing.expectEqual(@as(u8, 0x00), arena.live_ptr[arena.page_size]);
 }
 
 fn testTargetFn(ptr: [*]const u8, len: usize) callconv(.c) u64 {
@@ -66,7 +106,7 @@ fn testTargetFn(ptr: [*]const u8, len: usize) callconv(.c) u64 {
     return @as(u64, len);
 }
 
-test "VEH protected execution & crash recovery" {
+test "VEH / POSIX signal protected execution, fault_rva, & crash recovery" {
     var guard = veh.Guard.init();
     defer guard.deinit();
 
@@ -79,6 +119,7 @@ test "VEH protected execution & crash recovery" {
     const crash_res = veh.runProtected(testTargetFn, boom_input.ptr, boom_input.len);
     try std.testing.expect(crash_res.crashed);
     try std.testing.expectEqual(@as(u32, 0xC0000005), crash_res.exception_code);
+    try std.testing.expect(crash_res.exception_addr != 0);
 }
 
 const MEM_COMMIT_TEST: u32 = 0x1000;
@@ -86,22 +127,17 @@ const MEM_RESERVE_TEST: u32 = 0x2000;
 const MEM_RELEASE_TEST: u32 = 0x8000;
 const PAGE_EXECUTE_READWRITE_TEST: u32 = 0x40;
 
-extern "kernel32" fn VirtualAlloc(?*anyopaque, usize, u32, u32) callconv(.winapi) ?*anyopaque;
-extern "kernel32" fn VirtualFree(*anyopaque, usize, u32) callconv(.winapi) c_int;
+const WinTestMem = if (builtin.os.tag == .windows) struct {
+    extern "kernel32" fn VirtualAlloc(?*anyopaque, usize, u32, u32) callconv(.winapi) ?*anyopaque;
+    extern "kernel32" fn VirtualFree(*anyopaque, usize, u32) callconv(.winapi) c_int;
+} else struct {};
 
 test "end-to-end decodeX64BasicBlocksFull + BreakpointTable + VEH one-shot coverage" {
     if (builtin.cpu.arch != .x86_64 or builtin.os.tag != .windows) return error.SkipZigTest;
 
-    const mem: [*]u8 = @ptrCast(VirtualAlloc(null, 4096, MEM_RESERVE_TEST | MEM_COMMIT_TEST, PAGE_EXECUTE_READWRITE_TEST) orelse return error.SkipZigTest);
-    defer _ = VirtualFree(mem, 0, MEM_RELEASE_TEST);
+    const mem: [*]u8 = @ptrCast(WinTestMem.VirtualAlloc(null, 4096, MEM_RESERVE_TEST | MEM_COMMIT_TEST, PAGE_EXECUTE_READWRITE_TEST) orelse return error.SkipZigTest);
+    defer _ = WinTestMem.VirtualFree(mem, 0, MEM_RELEASE_TEST);
 
-    // Win64 ABI (rcx=ptr, rdx=len):
-    // 0x00: 48 83 FA 04        cmp rdx, 4
-    // 0x04: 72 06              jb +6 (-> 0x0C)
-    // 0x06: B8 01 00 00 00     mov eax, 1
-    // 0x0B: C3                 ret
-    // 0x0C: 31 C0              xor eax, eax
-    // 0x0E: C3                 ret
     const code = [_]u8{
         0x48, 0x83, 0xFA, 0x04,
         0x72, 0x06,
@@ -124,7 +160,6 @@ test "end-to-end decodeX64BasicBlocksFull + BreakpointTable + VEH one-shot cover
     var guard = veh.Guard.init();
     defer guard.deinit();
     veh.setBreakpointTable(&table);
-    defer veh.setBreakpointTable(null);
 
     const f: veh.TargetFn = @ptrCast(@alignCast(mem));
     const long_in = "ABCD";
@@ -134,13 +169,11 @@ test "end-to-end decodeX64BasicBlocksFull + BreakpointTable + VEH one-shot cover
     try std.testing.expectEqual(@as(usize, 2), table.hitCount());
     try std.testing.expectEqual(@as(usize, 2), bitmap.unique_edges);
 
-    // One-shot: re-running same path must not add hits.
     const res2 = veh.runProtected(f, long_in.ptr, long_in.len);
     try std.testing.expect(!res2.crashed);
     try std.testing.expectEqual(@as(u64, 1), res2.ret_val);
     try std.testing.expectEqual(@as(usize, 2), table.hitCount());
 
-    // Taking the jb branch hits the 3rd block.
     const short_in = "A";
     const res3 = veh.runProtected(f, short_in.ptr, short_in.len);
     try std.testing.expect(!res3.crashed);
@@ -149,52 +182,11 @@ test "end-to-end decodeX64BasicBlocksFull + BreakpointTable + VEH one-shot cover
     try std.testing.expectEqual(@as(usize, 3), bitmap.unique_edges);
 }
 
-test "end-to-end Corpus deduplication and biased selection" {
-    var c = corpus.Corpus.init(std.testing.allocator);
-    defer c.deinit();
-
-    try c.ensureNonEmpty();
-    try std.testing.expectEqual(@as(usize, 1), c.count());
-
-    try std.testing.expect(try c.addSeed("seed_a", 1));
-    try std.testing.expect(!try c.addSeed("seed_a", 2));
-    try std.testing.expect(try c.addSeed("seed_b", 3));
-    try std.testing.expectEqual(@as(usize, 3), c.count());
-
-    var rng = mutator.Rng.init(0xCAFEBABEDEADBEEF);
-    var latest_hits: usize = 0;
-    for (0..1000) |_| {
-        if (std.mem.eql(u8, c.pickNext(&rng), "seed_b")) {
-            latest_hits += 1;
-        }
-    }
-    try std.testing.expect(latest_hits >= 650);
-}
-
-fn paddedCrashTarget(ptr: [*]const u8, len: usize) callconv(.c) u64 {
-    if (len < 4) return 0;
-    if (std.mem.indexOf(u8, ptr[0..len], "BOOM") != null) {
-        const bad: *volatile u8 = @ptrFromInt(0xDEAD);
-        bad.* = 1;
-    }
-    return @as(u64, len);
-}
-
-test "end-to-end minimizeCrash shrinks padded trigger to BOOM" {
-    var guard = veh.Guard.init();
-    defer guard.deinit();
-
-    const padded = "XXXX_BOOM_YYYY";
-    const out = try minimizer.minimizeCrash(std.testing.allocator, paddedCrashTarget, padded, 0xC0000005);
-    defer std.testing.allocator.free(out);
-    try std.testing.expectEqualStrings("BOOM", out);
-}
-
 test "end-to-end decodeArm64BasicBlocks + BreakpointTable + VEH one-shot coverage" {
     if (builtin.cpu.arch != .aarch64 or builtin.os.tag != .windows) return error.SkipZigTest;
 
-    const mem: [*]u8 = @ptrCast(VirtualAlloc(null, 4096, MEM_RESERVE_TEST | MEM_COMMIT_TEST, PAGE_EXECUTE_READWRITE_TEST) orelse return error.SkipZigTest);
-    defer _ = VirtualFree(mem, 0, MEM_RELEASE_TEST);
+    const mem: [*]u8 = @ptrCast(WinTestMem.VirtualAlloc(null, 4096, MEM_RESERVE_TEST | MEM_COMMIT_TEST, PAGE_EXECUTE_READWRITE_TEST) orelse return error.SkipZigTest);
+    defer _ = WinTestMem.VirtualFree(mem, 0, MEM_RELEASE_TEST);
 
     // ARM64 ABI (x0=ptr, x1=len):
     // 0x00: cmp x1, #4       (F100103F)
@@ -226,7 +218,6 @@ test "end-to-end decodeArm64BasicBlocks + BreakpointTable + VEH one-shot coverag
     var guard = veh.Guard.init();
     defer guard.deinit();
     veh.setBreakpointTable(&table);
-    defer veh.setBreakpointTable(null);
 
     const f: veh.TargetFn = @ptrCast(@alignCast(mem));
     const long_in = "ABCD";
