@@ -98,12 +98,20 @@ fn vehHandler(ep: *EXCEPTION_POINTERS) callconv(.winapi) c_long {
 
     const code = ep.ExceptionRecord.ExceptionCode;
     switch (code) {
-        0xC0000005, // ACCESS_VIOLATION
-        0xC000001D, // ILLEGAL_INSTRUCTION
-        0xC0000094, // INTEGER_DIVIDE_BY_ZERO
-        0xC0000095, // INTEGER_OVERFLOW
-        0xC00000FD, // STACK_OVERFLOW
-        0x80000003, // BREAKPOINT
+        0x8000_0002, // DATATYPE_MISALIGNMENT (e.g. unaligned ARM64 atomic/LDXR)
+        0x8000_0003, // BREAKPOINT
+        0xC000_0005, // ACCESS_VIOLATION
+        0xC000_0006, // IN_PAGE_ERROR
+        0xC000_001D, // ILLEGAL_INSTRUCTION
+        0xC000_008C, // ARRAY_BOUNDS_EXCEEDED
+        0xC000_008E, // FLT_DIVIDE_BY_ZERO
+        0xC000_0090, // FLT_INVALID_OPERATION
+        0xC000_0091, // FLT_OVERFLOW
+        0xC000_0093, // FLT_UNDERFLOW
+        0xC000_0094, // INTEGER_DIVIDE_BY_ZERO
+        0xC000_0095, // INTEGER_OVERFLOW
+        0xC000_0096, // PRIVILEGED_INSTRUCTION
+        0xC000_00FD, // STACK_OVERFLOW
         => {
             g_caught = true;
             g_exc_code = code;
@@ -365,6 +373,14 @@ pub noinline fn runProtected(func: TargetFn, data: [*]const u8, len: usize) RunR
                   .x27 = true,
                   .x28 = true,
                   .x30 = true,
+                  .d8 = true,
+                  .d9 = true,
+                  .d10 = true,
+                  .d11 = true,
+                  .d12 = true,
+                  .d13 = true,
+                  .d14 = true,
+                  .d15 = true,
                   .memory = true,
                 }),
             .x86_64 => asm volatile (

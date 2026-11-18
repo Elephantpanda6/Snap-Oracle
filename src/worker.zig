@@ -32,11 +32,11 @@ pub fn runWorkerStdio(
     var guard = veh.Guard.init();
     defer guard.deinit();
 
-    veh.setTargetModuleBounds(@intFromPtr(target.module), img.size_of_image);
+    veh.setTargetModuleBounds(target.base_addr, img.size_of_image);
     defer veh.setTargetModuleBounds(0, 0);
 
     var bitmap = l1.CoverageBitmap{};
-    var bp_table = try coverage.BreakpointTable.init(allocator, @intFromPtr(target.module), img.machine, blocks, &bitmap);
+    var bp_table = try coverage.BreakpointTable.init(allocator, target.base_addr, img.machine, blocks, &bitmap);
     defer bp_table.deinit();
     veh.setBreakpointTable(&bp_table);
 
@@ -44,7 +44,7 @@ pub fn runWorkerStdio(
     defer arena.deinit();
     arena.takeSnapshot();
 
-    var mod_snap = try dll_snapshot.ModuleDataSnapshot.init(allocator, @intFromPtr(target.module), &img);
+    var mod_snap = try dll_snapshot.ModuleDataSnapshot.init(allocator, target.base_addr, &img);
     defer mod_snap.deinit();
 
     const stdin_f = std.Io.File.stdin();
@@ -62,6 +62,7 @@ pub fn runWorkerStdio(
 
         switch (frame.header.msg_type) {
             .quit => break,
+            .hello => try diff_protocol.writeFrame(stdout_f, io, .hello, hello_tag),
             .reset_req => {
                 _ = arena.restoreDirtyPages() catch 0;
                 _ = mod_snap.restore();
@@ -72,6 +73,7 @@ pub fn runWorkerStdio(
                 if (len > 0) {
                     @memcpy(arena.live_ptr[0..len], frame.payload[0..len]);
                 }
+                bitmap.resetTrace();
                 const prev_hits = bp_table.hitCount();
                 const res = veh.runProtected(target.entry, arena.live_ptr, len);
                 const new_edges: u32 = @intCast(bp_table.hitCount() - prev_hits);

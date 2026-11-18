@@ -50,6 +50,7 @@ pub const PeImage = struct {
     image_base: u64,
     entry_rva: u32,
     size_of_image: u32,
+    file_len: usize = std.math.maxInt(usize),
     export_dir_rva: u32,
     export_dir_size: u32,
     arm64_pac_unwind_fns: usize,
@@ -70,10 +71,11 @@ pub const PeImage = struct {
     pub fn rvaToOffset(self: *const PeImage, rva: u32) ?usize {
         for (self.sections) |sec| {
             const span = @max(sec.virtual_size, sec.raw_size);
-            if (rva >= sec.virtual_address and rva < sec.virtual_address + span) {
+            if (rva >= sec.virtual_address and rva < sec.virtual_address +| span) {
                 const delta = rva - sec.virtual_address;
                 if (delta < sec.raw_size) {
-                    return @as(usize, sec.raw_offset) + @as(usize, delta);
+                    const off = @as(usize, sec.raw_offset) +| @as(usize, delta);
+                    if (off < self.file_len) return off;
                 }
             }
         }
@@ -149,7 +151,6 @@ pub fn parsePe(allocator: std.mem.Allocator, bytes: []const u8) !PeImage {
     if (sec_table_off + @as(usize, num_sections) * 40 > bytes.len) return error.InvalidPe;
 
     const sections = try allocator.alloc(Section, num_sections);
-    errdefer allocator.free(sections);
 
     for (0..num_sections) |i| {
         const s_off = sec_table_off + i * 40;
@@ -170,6 +171,7 @@ pub fn parsePe(allocator: std.mem.Allocator, bytes: []const u8) !PeImage {
         .image_base = image_base,
         .entry_rva = entry_rva,
         .size_of_image = size_of_image,
+        .file_len = bytes.len,
         .export_dir_rva = 0,
         .export_dir_size = 0,
         .arm64_pac_unwind_fns = 0,
@@ -186,51 +188,53 @@ pub fn parsePe(allocator: std.mem.Allocator, bytes: []const u8) !PeImage {
         const pdata_size = try readU32(bytes, opt_off + 112 + 3 * 8 + 4);
         if (pdata_rva != 0) {
             if (img.rvaToOffset(pdata_rva)) |pdata_off| {
-                const max_avail = @min(@as(usize, pdata_size), bytes.len - pdata_off);
-                if (machine == .arm64 or machine == .arm64ec) {
-                    const count = max_avail / 8;
-                    var funcs = try allocator.alloc(RuntimeFunction, count);
-                    errdefer allocator.free(funcs);
-                    var valid: usize = 0;
-                    for (0..count) |i| {
-                        const f_off = pdata_off + i * 8;
-                        const begin_rva = try readU32(bytes, f_off);
-                        const unwind_data = try readU32(bytes, f_off + 4);
-                        if (begin_rva == 0 and unwind_data == 0) continue;
-                        const flag = unwind_data & 0x3;
-                        const fn_len_bytes: u32 = if (flag != 0) blk_packed: {
-                            // Packed ARM64 unwind CR (bits 21:20) == 2 indicates PAC-signed LR.
-                            const cr = (unwind_data >> 20) & 0x3;
-                            if (cr == 2) img.arm64_pac_unwind_fns += 1;
-                            break :blk_packed ((unwind_data >> 2) & 0x7FF) * 4;
-                        } else blk: {
-                            const xdata_rva = unwind_data & 0xFFFF_FFFC;
-                            const x_off = img.rvaToOffset(xdata_rva) orelse break :blk 0;
-                            const hdr = readU32(bytes, x_off) catch break :blk 0;
-                            break :blk (hdr & 0x3FFFF) * 4;
-                        };
-                        if (fn_len_bytes == 0) continue;
-                        funcs[valid] = .{
-                            .begin_rva = begin_rva,
-                            .end_rva = begin_rva +| fn_len_bytes,
-                            .unwind_rva = unwind_data,
-                        };
-                        valid += 1;
+                if (pdata_off < bytes.len) {
+                    const max_avail = @min(@as(usize, pdata_size), bytes.len - pdata_off);
+                    if (machine == .arm64 or machine == .arm64ec) {
+                        const count = max_avail / 8;
+                        var funcs = try allocator.alloc(RuntimeFunction, count);
+                        errdefer allocator.free(funcs);
+                        var valid: usize = 0;
+                        for (0..count) |i| {
+                            const f_off = pdata_off + i * 8;
+                            const begin_rva = try readU32(bytes, f_off);
+                            const unwind_data = try readU32(bytes, f_off + 4);
+                            if (begin_rva == 0 and unwind_data == 0) continue;
+                            const flag = unwind_data & 0x3;
+                            const fn_len_bytes: u32 = if (flag != 0) blk_packed: {
+                                // Packed ARM64 unwind: H=bit 20, CR=bits [22:21] (`2` = PAC-signed LR).
+                                const cr = (unwind_data >> 21) & 0x3;
+                                if (cr == 2) img.arm64_pac_unwind_fns += 1;
+                                break :blk_packed ((unwind_data >> 2) & 0x7FF) * 4;
+                            } else blk: {
+                                const xdata_rva = unwind_data & 0xFFFF_FFFC;
+                                const x_off = img.rvaToOffset(xdata_rva) orelse break :blk 0;
+                                const hdr = readU32(bytes, x_off) catch break :blk 0;
+                                break :blk (hdr & 0x3FFFF) * 4;
+                            };
+                            if (fn_len_bytes == 0) continue;
+                            funcs[valid] = .{
+                                .begin_rva = begin_rva,
+                                .end_rva = begin_rva +| fn_len_bytes,
+                                .unwind_rva = unwind_data,
+                            };
+                            valid += 1;
+                        }
+                        img.functions = try allocator.realloc(funcs, valid);
+                    } else if (pdata_size >= 12) {
+                        const count = max_avail / 12;
+                        var funcs = try allocator.alloc(RuntimeFunction, count);
+                        errdefer allocator.free(funcs);
+                        for (0..count) |i| {
+                            const f_off = pdata_off + i * 12;
+                            funcs[i] = .{
+                                .begin_rva = try readU32(bytes, f_off),
+                                .end_rva = try readU32(bytes, f_off + 4),
+                                .unwind_rva = try readU32(bytes, f_off + 8),
+                            };
+                        }
+                        img.functions = funcs;
                     }
-                    img.functions = try allocator.realloc(funcs, valid);
-                } else if (pdata_size >= 12) {
-                    const count = max_avail / 12;
-                    var funcs = try allocator.alloc(RuntimeFunction, count);
-                    errdefer allocator.free(funcs);
-                    for (0..count) |i| {
-                        const f_off = pdata_off + i * 12;
-                        funcs[i] = .{
-                            .begin_rva = try readU32(bytes, f_off),
-                            .end_rva = try readU32(bytes, f_off + 4),
-                            .unwind_rva = try readU32(bytes, f_off + 8),
-                        };
-                    }
-                    img.functions = funcs;
                 }
             }
         }
@@ -244,7 +248,7 @@ pub fn parsePe(allocator: std.mem.Allocator, bytes: []const u8) !PeImage {
         img.export_dir_size = exp_size;
         if (exp_rva != 0) {
             if (img.rvaToOffset(exp_rva)) |exp_off| {
-                if (exp_off + 40 <= bytes.len) {
+                if (exp_off +| 40 <= bytes.len) {
                     const num_names = try readU32(bytes, exp_off + 24);
                     const funcs_rva = try readU32(bytes, exp_off + 28);
                     const names_rva = try readU32(bytes, exp_off + 32);
@@ -252,19 +256,21 @@ pub fn parsePe(allocator: std.mem.Allocator, bytes: []const u8) !PeImage {
                     if (img.rvaToOffset(funcs_rva)) |funcs_off| {
                         if (img.rvaToOffset(names_rva)) |names_off| {
                             if (img.rvaToOffset(ords_rva)) |ords_off| {
-                                var exps = try allocator.alloc(ExportSymbol, num_names);
+                                const max_names = @min(@as(usize, num_names), (bytes.len - names_off) / 4);
+                                var exps = try allocator.alloc(ExportSymbol, max_names);
                                 var valid: usize = 0;
                                 errdefer {
                                     for (exps[0..valid]) |e| allocator.free(e.name);
                                     allocator.free(exps);
                                 }
-                                for (0..num_names) |i| {
+                                for (0..max_names) |i| {
                                     if (names_off + i * 4 + 4 > bytes.len or ords_off + i * 2 + 2 > bytes.len) break;
                                     const n_rva = try readU32(bytes, names_off + i * 4);
                                     const ord = try readU16(bytes, ords_off + i * 2);
-                                    if (funcs_off + @as(usize, ord) * 4 + 4 > bytes.len) continue;
+                                    if (funcs_off +| @as(usize, ord) * 4 +| 4 > bytes.len) continue;
                                     const fn_rva = try readU32(bytes, funcs_off + @as(usize, ord) * 4);
                                     if (img.rvaToOffset(n_rva)) |n_off| {
+                                        if (n_off >= bytes.len) continue;
                                         const rest = bytes[n_off..];
                                         const nul = std.mem.indexOfScalar(u8, rest, 0) orelse continue;
                                         const forwarded = exp_size > 0 and fn_rva >= exp_rva and fn_rva < exp_rva +| exp_size;
@@ -351,9 +357,9 @@ test "pe parses synthetic ARM64 PE32+ with .pdata, writable .data, and owned exp
     std.mem.writeInt(u16, raw[0x330..][0..2], 0, .little); // ordinal
     @memcpy(raw[0x334 .. 0x334 + 10], "arm_fn\x00\x00\x00\x00");
 
-    // .pdata at raw 0x400 (RVA 0x2100): BeginRVA=0x1000, packed flag=1, len=8 words (32B), CR=2 (PAC)
+    // .pdata at raw 0x400 (RVA 0x2100): BeginRVA=0x1000, packed flag=1, len=8 words (32B), CR=2 (PAC, bits 22:21)
     std.mem.writeInt(u32, raw[0x400..][0..4], 0x1000, .little);
-    const unwind: u32 = 1 | (8 << 2) | (2 << 20);
+    const unwind: u32 = 1 | (8 << 2) | (2 << 21);
     std.mem.writeInt(u32, raw[0x404..][0..4], unwind, .little);
 
     const copy = try std.testing.allocator.dupe(u8, &raw);

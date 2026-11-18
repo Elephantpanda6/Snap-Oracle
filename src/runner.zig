@@ -23,8 +23,19 @@ const WinDyn = if (builtin.os.tag == .windows) struct {
     extern "kernel32" fn QueryPerformanceCounter(lpPerformanceCount: *i64) callconv(.winapi) i32;
 } else struct {};
 
+const PosixDyn = if (builtin.os.tag != .windows) struct {
+    const DlInfo = extern struct {
+        dli_fname: ?[*:0]const u8,
+        dli_fbase: ?*anyopaque,
+        dli_sname: ?[*:0]const u8,
+        dli_saddr: ?*anyopaque,
+    };
+    extern "c" fn dladdr(addr: *const anyopaque, info: *DlInfo) callconv(.c) c_int;
+} else struct {};
+
 pub const LoadedTarget = struct {
     module: HMODULE,
+    base_addr: usize,
     entry: veh.TargetFn,
 
     pub fn load(allocator: std.mem.Allocator, dll_path: []const u8, entry_name: []const u8) !LoadedTarget {
@@ -42,14 +53,21 @@ pub const LoadedTarget = struct {
             const proc = WinDyn.GetProcAddress(mod, entry_z.ptr) orelse return error.EntryNotFound;
             return .{
                 .module = mod,
+                .base_addr = @intFromPtr(mod),
                 .entry = @ptrCast(@alignCast(proc)),
             };
         } else {
             const mod = std.c.dlopen(path_z.ptr, .{ .NOW = true }) orelse return error.LoadLibraryFailed;
             errdefer _ = std.c.dlclose(mod);
             const proc = std.c.dlsym(mod, entry_z.ptr) orelse return error.EntryNotFound;
+            var dli: PosixDyn.DlInfo = std.mem.zeroes(PosixDyn.DlInfo);
+            const base = if (PosixDyn.dladdr(proc, &dli) != 0 and dli.dli_fbase != null)
+                @intFromPtr(dli.dli_fbase.?)
+            else
+                @intFromPtr(mod);
             return .{
                 .module = mod,
+                .base_addr = base,
                 .entry = @ptrCast(@alignCast(proc)),
             };
         }
@@ -144,11 +162,11 @@ pub fn runFuzzEx(io: std.Io, allocator: std.mem.Allocator, opts: FuzzOptions) !v
     var guard = veh.Guard.init();
     defer guard.deinit();
 
-    veh.setTargetModuleBounds(@intFromPtr(target.module), img.size_of_image);
+    veh.setTargetModuleBounds(target.base_addr, img.size_of_image);
     defer veh.setTargetModuleBounds(0, 0);
 
     var bitmap = l1.CoverageBitmap{};
-    var bp_table = try coverage.BreakpointTable.init(allocator, @intFromPtr(target.module), img.machine, blocks, &bitmap);
+    var bp_table = try coverage.BreakpointTable.init(allocator, target.base_addr, img.machine, blocks, &bitmap);
     defer bp_table.deinit();
     veh.setBreakpointTable(&bp_table);
 
@@ -157,8 +175,11 @@ pub fn runFuzzEx(io: std.Io, allocator: std.mem.Allocator, opts: FuzzOptions) !v
     @memset(arena.live_ptr[0..max_input], 0x41);
     arena.takeSnapshot();
 
-    var mod_snap = try dll_snapshot.ModuleDataSnapshot.init(allocator, @intFromPtr(target.module), &img);
+    var mod_snap = try dll_snapshot.ModuleDataSnapshot.init(allocator, target.base_addr, &img);
     defer mod_snap.deinit();
+
+    const input_copy = try allocator.alloc(u8, max_input);
+    defer allocator.free(input_copy);
 
     var rng = mutator.Rng.init(opts.seed orelse prngSeed(io, 0x517cc1b727220a95));
 
@@ -198,11 +219,13 @@ pub fn runFuzzEx(io: std.Io, allocator: std.mem.Allocator, opts: FuzzOptions) !v
         const seed = corp.pickWeighted(&rng);
         const n = @min(seed.len, max_input);
         const pad = @min(rng.below(9), max_input - n);
-        @memcpy(arena.live_ptr[0..n], seed[0..n]);
-        for (0..pad) |k| arena.live_ptr[n + k] = if (n > 0) seed[k % n] else 0x41;
+        @memcpy(input_copy[0..n], seed[0..n]);
+        for (0..pad) |k| input_copy[n + k] = if (n > 0) seed[k % n] else 0x41;
         const total = n + pad;
-        const mlen = mutator.mutateWithDict(&rng, arena.live_ptr[0..max_input], total, max_input, &dict);
+        const mlen = mutator.mutateWithDict(&rng, input_copy[0..max_input], total, max_input, &dict);
+        @memcpy(arena.live_ptr[0..mlen], input_copy[0..mlen]);
 
+        bitmap.resetTrace();
         const prev_hits = bp_table.hitCount();
         const res = veh.runProtected(target.entry, arena.live_ptr, mlen);
 
@@ -215,7 +238,7 @@ pub fn runFuzzEx(io: std.Io, allocator: std.mem.Allocator, opts: FuzzOptions) !v
                 unique_crashes += 1;
                 var name_buf: [64]u8 = undefined;
                 const fname = try std.fmt.bufPrint(&name_buf, "crash_{x:0>16}.bin", .{h});
-                std.Io.Dir.cwd().writeFile(io, .{ .sub_path = fname, .data = arena.live_ptr[0..mlen] }) catch {};
+                std.Io.Dir.cwd().writeFile(io, .{ .sub_path = fname, .data = input_copy[0..mlen] }) catch {};
                 std.debug.print(
                     "[fuzz] NEW CRASH #{d} code=0x{x:0>8} rva=0x{x} addr=0x{x} len={d} -> {s}\n",
                     .{ unique_crashes, res.exception_code, res.fault_rva, res.exception_addr, mlen, fname },
@@ -225,8 +248,8 @@ pub fn runFuzzEx(io: std.Io, allocator: std.mem.Allocator, opts: FuzzOptions) !v
 
         const new_hits = bp_table.hitCount() - prev_hits;
         if (new_hits > 0) {
-            if (try corp.addSeed(arena.live_ptr[0..mlen], new_hits)) {
-                if (opts.corpus_dir) |dir| saveSeed(io, allocator, dir, arena.live_ptr[0..mlen]);
+            if (try corp.addSeed(input_copy[0..mlen], new_hits)) {
+                if (opts.corpus_dir) |dir| saveSeed(io, allocator, dir, input_copy[0..mlen]);
             }
         }
         total_dirty_pages += arena.restoreDirtyPages() catch 0;
@@ -315,9 +338,9 @@ pub fn runDiff(
     defer arena.deinit();
     arena.takeSnapshot();
 
-    var snap_a = try dll_snapshot.ModuleDataSnapshot.init(allocator, @intFromPtr(t_a.module), &bin_a);
+    var snap_a = try dll_snapshot.ModuleDataSnapshot.init(allocator, t_a.base_addr, &bin_a);
     defer snap_a.deinit();
-    var snap_b = try dll_snapshot.ModuleDataSnapshot.init(allocator, @intFromPtr(t_b.module), &bin_b);
+    var snap_b = try dll_snapshot.ModuleDataSnapshot.init(allocator, t_b.base_addr, &bin_b);
     defer snap_b.deinit();
 
     var dict = mutator.Dictionary.init();
@@ -325,21 +348,22 @@ pub fn runDiff(
     _ = dict_extract.extractFromBinary(allocator, bytes_b, &dict) catch 0;
 
     var rng = mutator.Rng.init(prngSeed(io, 0x9e3779b97f4a7c15));
-    var input_seed: [256]u8 = @splat(0x41);
+    var mut_buf: [256]u8 = @splat(0x41);
     var divergences: usize = 0;
 
     var i: usize = 0;
     while (i < iters) : (i += 1) {
-        @memcpy(arena.live_ptr[0..input_seed.len], &input_seed);
-        const mlen = mutator.mutateWithDict(&rng, arena.live_ptr[0..256], 64, 256, &dict);
+        @memset(&mut_buf, 0x41);
+        const mlen = mutator.mutateWithDict(&rng, &mut_buf, 64, mut_buf.len, &dict);
 
-        veh.setTargetModuleBounds(@intFromPtr(t_a.module), bin_a.size_of_image);
+        @memcpy(arena.live_ptr[0..mlen], mut_buf[0..mlen]);
+        veh.setTargetModuleBounds(t_a.base_addr, bin_a.size_of_image);
         const r_a = veh.runProtected(t_a.entry, arena.live_ptr, mlen);
         _ = arena.restoreDirtyPages() catch 0;
         _ = snap_a.restore();
 
-        @memcpy(arena.live_ptr[0..mlen], arena.live_ptr[0..mlen]);
-        veh.setTargetModuleBounds(@intFromPtr(t_b.module), bin_b.size_of_image);
+        @memcpy(arena.live_ptr[0..mlen], mut_buf[0..mlen]);
+        veh.setTargetModuleBounds(t_b.base_addr, bin_b.size_of_image);
         const r_b = veh.runProtected(t_b.entry, arena.live_ptr, mlen);
         _ = arena.restoreDirtyPages() catch 0;
         _ = snap_b.restore();
@@ -384,14 +408,14 @@ pub fn runReplay(
     var guard = veh.Guard.init();
     defer guard.deinit();
 
-    veh.setTargetModuleBounds(@intFromPtr(target.module), img.size_of_image);
+    veh.setTargetModuleBounds(target.base_addr, img.size_of_image);
     defer veh.setTargetModuleBounds(0, 0);
 
     var arena = try l1.SnapshotArena.init(allocator, @max(64 * 1024, data.len));
     defer arena.deinit();
     arena.takeSnapshot();
 
-    var mod_snap = try dll_snapshot.ModuleDataSnapshot.init(allocator, @intFromPtr(target.module), &img);
+    var mod_snap = try dll_snapshot.ModuleDataSnapshot.init(allocator, target.base_addr, &img);
     defer mod_snap.deinit();
 
     @memcpy(arena.live_ptr[0..data.len], data);

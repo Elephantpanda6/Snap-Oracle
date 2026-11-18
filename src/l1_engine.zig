@@ -61,8 +61,12 @@ pub const CoverageBitmap = struct {
     prev_loc: u16 = 0,
     unique_edges: usize = 0,
 
+    pub fn resetTrace(self: *CoverageBitmap) void {
+        self.prev_loc = 0;
+    }
+
     pub fn recordEdge(self: *CoverageBitmap, pc: u64) bool {
-        const cur: u16 = @truncate((pc >> 2) ^ (pc >> 16));
+        const cur: u16 = @truncate((pc >> 1) ^ (pc >> 16));
         const idx = self.prev_loc ^ cur;
         self.prev_loc = cur >> 1;
         if (self.bits[idx] == 0) {
@@ -96,16 +100,15 @@ pub const SnapshotArena = struct {
                 MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
                 PAGE_READWRITE,
             ) orelse return error.VirtualAllocFailed;
+            errdefer _ = WinExports.VirtualFree(live_raw, 0, MEM_RELEASE);
 
             const clean_raw = WinExports.VirtualAlloc(
                 null,
                 aligned_size,
                 MEM_RESERVE | MEM_COMMIT,
                 PAGE_READWRITE,
-            ) orelse {
-                _ = WinExports.VirtualFree(live_raw, 0, MEM_RELEASE);
-                return error.VirtualAllocFailed;
-            };
+            ) orelse return error.VirtualAllocFailed;
+            errdefer _ = WinExports.VirtualFree(clean_raw, 0, MEM_RELEASE);
 
             const max_pages = aligned_size / psize;
             const dirty_addrs = try allocator.alloc(?*anyopaque, max_pages);
@@ -137,6 +140,7 @@ pub const SnapshotArena = struct {
                 -1,
                 0,
             ) catch return error.MmapFailed;
+            errdefer std.posix.munmap(clean_slice);
 
             const max_pages = aligned_size / psize;
             const dirty_addrs = try allocator.alloc(?*anyopaque, max_pages);
@@ -182,8 +186,10 @@ pub const SnapshotArena = struct {
         if (builtin.os.tag == .windows) {
             var count: usize = self.dirty_addrs.len;
             var gran: u32 = @intCast(self.page_size);
+            // Query without WRITE_WATCH_FLAG_RESET first; resetting after the restore writes ensures
+            // clean restored pages are not immediately re-marked dirty for the next iteration.
             const rc = WinExports.GetWriteWatch(
-                WRITE_WATCH_FLAG_RESET,
+                0,
                 self.live_ptr,
                 self.size,
                 self.dirty_addrs.ptr,
@@ -198,6 +204,9 @@ pub const SnapshotArena = struct {
                 if (addr < base_addr or addr + self.page_size > base_addr + self.size) continue;
                 const off = addr - base_addr;
                 arch.fastRestorePage(self.live_ptr + off, self.clean_ptr + off, self.page_size);
+            }
+            if (count > 0) {
+                _ = WinExports.ResetWriteWatch(self.live_ptr, self.size);
             }
             return count;
         } else {
@@ -221,18 +230,23 @@ pub fn flushCodeRange(addr: *const anyopaque, len: usize) void {
     } else if (builtin.os.tag == .macos) {
         DarwinExports.sys_icache_invalidate(addr, len);
     } else if (builtin.cpu.arch == .aarch64) {
+        const ctr = asm ("mrs %[ret], ctr_el0"
+            : [ret] "=r" (-> u64),
+        );
+        const dline: usize = @as(usize, 4) << @intCast((ctr >> 16) & 0xF);
+        const iline: usize = @as(usize, 4) << @intCast(ctr & 0xF);
         const start = @intFromPtr(addr);
         const end = start + len;
-        var p = start & ~@as(usize, 63);
-        while (p < end) : (p += 64) {
+        var p = start & ~(dline - 1);
+        while (p < end) : (p += dline) {
             asm volatile ("dc cvau, %[p]"
                 :
                 : [p] "r" (p),
             );
         }
         asm volatile ("dsb ish");
-        p = start & ~@as(usize, 63);
-        while (p < end) : (p += 64) {
+        p = start & ~(iline - 1);
+        while (p < end) : (p += iline) {
             asm volatile ("ic ivau, %[p]"
                 :
                 : [p] "r" (p),

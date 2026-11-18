@@ -24,7 +24,7 @@ pub fn extractFromReadOnlyData(slice: []const u8, dict: *mutator.Dictionary) usi
         if (len >= 2 and len <= 16) {
             if (dict.add(slice[i..j])) added += 1;
         }
-        i = j + 1;
+        i = if (j < slice.len and isPrintableAscii(slice[j])) j else j + 1;
     }
     return added;
 }

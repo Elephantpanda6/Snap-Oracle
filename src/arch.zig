@@ -25,11 +25,15 @@ pub inline fn readCycleCounter() u64 {
         .aarch64 => asm volatile ("mrs %[ret], cntvct_el0"
             : [ret] "=r" (-> u64),
         ),
-        .x86_64 => asm volatile ("rdtsc"
-            : [ret] "={rax}" (-> u64),
-            :
-            : .{ .rdx = true }
-        ),
+        .x86_64 => blk: {
+            var lo: u32 = 0;
+            var hi: u32 = 0;
+            asm volatile ("rdtsc"
+                : [lo] "={eax}" (lo),
+                  [hi] "={edx}" (hi),
+            );
+            break :blk (@as(u64, hi) << 32) | @as(u64, lo);
+        },
         else => 0,
     };
 }

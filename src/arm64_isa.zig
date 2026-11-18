@@ -75,36 +75,36 @@ pub fn decode(insn: u32) DecodedArm64 {
     }
 
     // BTI hints: `0xD503241F` (`bti`), `0xD503245F` (`bti c`), `0xD503249F` (`bti j`), `0xD50324DF` (`bti jc`)
-    if ((insn & 0xFFFF_FF3F) == 0xD503_241F and (insn & 0x0000_00C0) != 0) {
+    if ((insn & 0xFFFF_FF3F) == 0xD503_241F) {
         return .{ .raw = insn, .class = .bti };
     }
 
     // Pointer Authentication prologue/epilogue hint & general instructions
     switch (insn) {
-        0xD503_233F, // paciasp
-        0xD503_237F, // pacibsp
         0xD503_211F, // pacia1716
         0xD503_215F, // pacib1716
-        0xD503_219F, // paciaz
-        0xD503_21DF, // pacibz
+        0xD503_231F, // paciaz
+        0xD503_233F, // paciasp
+        0xD503_235F, // pacibz
+        0xD503_237F, // pacibsp
         => return .{ .raw = insn, .class = .pac_sign },
 
+        0xD503_219F, // autia1716
+        0xD503_21DF, // autib1716
+        0xD503_239F, // autiaz
         0xD503_23BF, // autiasp
+        0xD503_23DF, // autibz
         0xD503_23FF, // autibsp
-        0xD503_213F, // autia1716
-        0xD503_217F, // autib1716
-        0xD503_21BF, // autiaz
-        0xD503_21FF, // autibz
         => return .{ .raw = insn, .class = .pac_auth },
 
         0xD65F_0BFF => return .{ .raw = insn, .class = .retaa, .falls_through = false, .is_terminator = true },
         0xD65F_0FFF => return .{ .raw = insn, .class = .retab, .falls_through = false, .is_terminator = true },
-        0xD69F_03E0 => return .{ .raw = insn, .class = .eret, .falls_through = false, .is_terminator = true },
+        0xD69F_03E0, 0xD69F_0BFF, 0xD69F_0FFF => return .{ .raw = insn, .class = .eret, .falls_through = false, .is_terminator = true },
         else => {},
     }
 
     // XPACI / XPACD / XPACLRI
-    if ((insn & 0xFFFF_FBFF) == 0xDAC1_43E0 or insn == 0xD503_20FF) {
+    if ((insn & 0xFFFF_FBE0) == 0xDAC1_43E0 or insn == 0xD503_20FF) {
         return .{ .raw = insn, .class = .xpac, .rd = @truncate(insn & 0x1F) };
     }
 
@@ -129,10 +129,10 @@ pub fn decode(insn: u32) DecodedArm64 {
     if ((insn & 0xFFFF_FC1F) == 0xD63F_0000) {
         return .{ .raw = insn, .class = .blr, .rn = @truncate((insn >> 5) & 0x1F), .falls_through = true };
     }
-    if ((insn & 0xFEFF_F800) == 0xD71F_0000 or (insn & 0xFFFF_F81F) == 0xD61F_081F) {
+    if ((insn & 0xFFFF_F800) == 0xD71F_0800 or (insn & 0xFFFF_F81F) == 0xD61F_081F) {
         return .{ .raw = insn, .class = .braa, .rn = @truncate((insn >> 5) & 0x1F), .falls_through = false, .is_terminator = true };
     }
-    if ((insn & 0xFEFF_F800) == 0xD73F_0000 or (insn & 0xFFFF_F81F) == 0xD63F_081F) {
+    if ((insn & 0xFFFF_F800) == 0xD73F_0800 or (insn & 0xFFFF_F81F) == 0xD63F_081F) {
         return .{ .raw = insn, .class = .blraa, .rn = @truncate((insn >> 5) & 0x1F), .falls_through = true };
     }
 
@@ -218,12 +218,21 @@ pub fn decode(insn: u32) DecodedArm64 {
         }
     }
 
-    // Load/Store Exclusive monitor (LDXR/LDAXR/LDXP/STXR/STLXR/STXP) - must never trap between LDXR..STXR
-    // Load/store exclusive group has op0=x0, op1=0, op2=0, bit24=0 (`(insn & 0x3F00_0000) == 0x0800_0000`)
+    // RCPC load-acquire (LDAPR / LDAPUR / STLUR) — must precede LSE check because LDAPR overlaps 0x38200000 space
+    if ((insn & 0x3FFF_FC00) == 0x38BF_C000 or (insn & 0x3F20_0C00) == 0x1900_0000) {
+        return .{ .raw = insn, .class = .rcpc_atomic, .rd = @truncate(insn & 0x1F) };
+    }
+
+    // Load/Store Exclusive monitor (LDXR/LDAXR/LDXP/STXR/STLXR/STXP) vs Load-Acquire/Store-Release (LDAR/STLR) vs LSE CAS
+    // Group: op0=x0, op1=0, op2=0, bit24=0 (`(insn & 0x3F00_0000) == 0x0800_0000`)
     if ((insn & 0x3F00_0000) == 0x0800_0000) {
-        const is_lse_cas = (insn & 0x00A0_0000) == 0x00A0_0000;
-        if (is_lse_cas) {
+        const o2 = (insn >> 23) & 1;
+        const o1 = (insn >> 21) & 1;
+        if (o2 == 1 and o1 == 1) {
             return .{ .raw = insn, .class = .lse_atomic, .rd = @truncate(insn & 0x1F) };
+        }
+        if (o2 == 1 and o1 == 0) {
+            return .{ .raw = insn, .class = .rcpc_atomic, .rd = @truncate(insn & 0x1F) };
         }
         const is_load = (insn & 0x0040_0000) != 0;
         return .{
@@ -237,11 +246,6 @@ pub fn decode(insn: u32) DecodedArm64 {
     // LSE atomics (LDADD/LDCLR/LDEOR/LDSET/SWP/LDMAX/LDMIN/CASP): op0=x11, op1=1, bit21=1, bits[11:10]=00
     if ((insn & 0x3B20_0C00) == 0x3820_0000) {
         return .{ .raw = insn, .class = .lse_atomic, .rd = @truncate(insn & 0x1F) };
-    }
-
-    // RCPC load-acquire (LDAPUR / LDAPR): `(insn & 0x3FA0_0C00) == 0x1900_0000` or `0x38BF_C000`
-    if ((insn & 0x3FE0_FC00) == 0x38BF_C000 or (insn & 0x3FA0_0C00) == 0x1940_0000) {
-        return .{ .raw = insn, .class = .rcpc_atomic, .rd = @truncate(insn & 0x1F) };
     }
 
     // Move wide immediate: MOVN (opc=00), MOVZ (opc=10), MOVK (opc=11)
@@ -314,7 +318,7 @@ pub fn decode(insn: u32) DecodedArm64 {
     if ((insn & 0x1E00_0000) == 0x0E00_0000) {
         return .{ .raw = insn, .class = .neon_simd };
     }
-    if ((insn & 0x5F00_0000) == 0x1E00_0000) {
+    if ((insn & 0x5E00_0000) == 0x1E00_0000) {
         return .{ .raw = insn, .class = .fp_scalar };
     }
 
@@ -342,7 +346,7 @@ pub fn findExclusiveZones(allocator: std.mem.Allocator, code: []const u8, base_r
             var end_rva: u32 = start_rva + 4;
             // Scan up to 16 instructions forward for matching STXR/STLXR or CLREX.
             var k: usize = off + 4;
-            const limit = @min(code.len, off + 64);
+            const limit = @min(code.len, off + 68);
             while (k + 4 <= limit) : (k += 4) {
                 const next_insn = std.mem.readInt(u32, code[k..][0..4], .little);
                 const cls = decode(next_insn).class;
@@ -401,6 +405,20 @@ test "arm64_isa decodes branches, BTI, PAC, LSE, NEON, MOVZ/CMP" {
 
     // LSE LDADDAL w0, w1, [x2] -> 0xB8E00041
     try std.testing.expectEqual(InsnClass.lse_atomic, decode(0xB8E0_0041).class);
+
+    // Regression checks for PAC hints, plain BTI, XPAC Rd, BRAA/BLRAA Rm, LDAR/STLR, LDAPR:
+    try std.testing.expectEqual(InsnClass.bti, decode(0xD503_241F).class); // plain bti
+    try std.testing.expectEqual(InsnClass.pac_sign, decode(0xD503_231F).class); // paciaz
+    try std.testing.expectEqual(InsnClass.pac_sign, decode(0xD503_235F).class); // pacibz
+    try std.testing.expectEqual(InsnClass.pac_auth, decode(0xD503_239F).class); // autiaz
+    try std.testing.expectEqual(InsnClass.pac_auth, decode(0xD503_219F).class); // autia1716
+    try std.testing.expectEqual(InsnClass.xpac, decode(0xDAC1_43E1).class); // xpaci x1
+    try std.testing.expectEqual(InsnClass.braa, decode(0xD71F_0822).class); // braa x1, x2
+    try std.testing.expectEqual(InsnClass.blraa, decode(0xD73F_0822).class); // blraa x1, x2
+    try std.testing.expectEqual(InsnClass.eret, decode(0xD69F_0BFF).class); // eretaa
+    try std.testing.expectEqual(InsnClass.rcpc_atomic, decode(0x88DF_FC20).class); // ldar w0, [x1]
+    try std.testing.expectEqual(InsnClass.rcpc_atomic, decode(0x889F_FC20).class); // stlr w0, [x1]
+    try std.testing.expectEqual(InsnClass.rcpc_atomic, decode(0xB8BF_C020).class); // ldapr w0, [x1]
 }
 
 test "arm64_isa detects exclusive LDXR..STXR monitor zones" {

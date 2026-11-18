@@ -96,6 +96,7 @@ pub fn readExact(file: std.Io.File, io: std.Io, buf: []u8) !void {
 }
 
 pub fn writeFrame(file: std.Io.File, io: std.Io, msg_type: MsgType, payload: []const u8) !void {
+    if (payload.len > MAX_PAYLOAD_LEN) return error.PayloadTooLarge;
     const hdr = encodeHeader(.{
         .msg_type = msg_type,
         .payload_len = @intCast(payload.len),

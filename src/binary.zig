@@ -56,10 +56,10 @@ pub const BinaryImage = struct {
     pub fn rvaToOffset(self: *const BinaryImage, rva: u32) ?usize {
         for (self.sections) |sec| {
             const span = @max(sec.virtual_size, sec.raw_size);
-            if (rva >= sec.virtual_address and rva < sec.virtual_address + span) {
+            if (rva >= sec.virtual_address and rva < sec.virtual_address +| span) {
                 const delta = rva - sec.virtual_address;
                 if (delta < sec.raw_size) {
-                    return @as(usize, sec.raw_offset) + @as(usize, delta);
+                    return @as(usize, sec.raw_offset) +| @as(usize, delta);
                 }
             }
         }
@@ -118,7 +118,7 @@ pub fn parseBinary(allocator: std.mem.Allocator, bytes: []const u8) !BinaryImage
             .functions = m.functions,
             .exports = m.exports,
             .has_pac = m.has_pac,
-            .has_bti = m.has_pac,
+            .has_bti = false,
             .is_arm64ec = false,
             .min_segment_align = 16384,
             .allocator = m.allocator,

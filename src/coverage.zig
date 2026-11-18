@@ -166,16 +166,17 @@ pub const BreakpointTable = struct {
         return self;
     }
 
-    fn restoreSite(addr: usize, site: SavedSite) void {
-        _ = patchCode(addr, site.orig[0..site.len], site.orig_protect);
+    fn restoreSite(addr: usize, site: SavedSite) bool {
+        return patchCode(addr, site.orig[0..site.len], site.orig_protect);
     }
 
     /// One-shot: if `addr` is an armed breakpoint, restore the original instruction, record the
     /// coverage edge, and return true (caller should resume at `addr`).
     pub fn handleBreakpoint(self: *BreakpointTable, addr: usize) bool {
         const key: usize = if (isArm(self.machine)) @intCast(arch.stripPac(addr)) else addr;
-        const kv = self.orig_bytes.fetchRemove(key) orelse return false;
-        restoreSite(key, kv.value);
+        const site = self.orig_bytes.get(key) orelse return false;
+        if (!restoreSite(key, site)) return false;
+        _ = self.orig_bytes.remove(key);
         _ = self.bitmap.recordEdge(key);
         return true;
     }
@@ -193,7 +194,7 @@ pub const BreakpointTable = struct {
     pub fn deinit(self: *BreakpointTable) void {
         veh.clearBreakpointTableIf(self);
         var it = self.orig_bytes.iterator();
-        while (it.next()) |e| restoreSite(e.key_ptr.*, e.value_ptr.*);
+        while (it.next()) |e| _ = restoreSite(e.key_ptr.*, e.value_ptr.*);
         self.orig_bytes.deinit();
         self.total = 0;
     }

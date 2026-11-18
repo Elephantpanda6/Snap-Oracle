@@ -7,11 +7,13 @@ pub const EM_AARCH64: u16 = 183;
 const SHT_SYMTAB: u32 = 2;
 const SHT_STRTAB: u32 = 3;
 const SHT_NOTE: u32 = 7;
+const SHT_NOBITS: u32 = 8;
 const SHT_DYNSYM: u32 = 11;
 
 const SHF_WRITE: u64 = 0x1;
 const SHF_ALLOC: u64 = 0x2;
 const SHF_EXECINSTR: u64 = 0x4;
+const SHF_TLS: u64 = 0x400;
 
 const STT_FUNC: u8 = 2;
 const STB_GLOBAL: u8 = 1;
@@ -86,11 +88,12 @@ pub fn parseElf(allocator: std.mem.Allocator, bytes: []const u8) !ElfImage {
     var min_align: u32 = 4096;
     var found_load = false;
 
-    if (e_phoff != 0 and e_phentsize >= 56) {
+    if (e_phoff != 0 and e_phentsize >= 56 and e_phoff <= bytes.len) {
+        const ph_base: usize = @intCast(e_phoff);
         var pi: usize = 0;
         while (pi < e_phnum) : (pi += 1) {
-            const off = @as(usize, @intCast(e_phoff)) + pi * e_phentsize;
-            if (off + 56 > bytes.len) break;
+            const off = ph_base +| (pi *| e_phentsize);
+            if (off +| 56 > bytes.len) break;
             const p_type = try readU32(bytes, off);
             if (p_type == 1) { // PT_LOAD
                 const p_vaddr = try readU64(bytes, off + 16);
@@ -122,25 +125,35 @@ pub fn parseElf(allocator: std.mem.Allocator, bytes: []const u8) !ElfImage {
         for (exp_list.items) |e| allocator.free(e.name);
         exp_list.deinit(allocator);
     }
+    var seen_fn_rvas = std.AutoHashMap(u32, void).init(allocator);
+    defer seen_fn_rvas.deinit();
+    var seen_exp_names = std.StringHashMap(void).init(allocator);
+    defer seen_exp_names.deinit();
 
     var has_bti = false;
     var has_pac = false;
 
     var shstr_off: usize = 0;
     var shstr_size: usize = 0;
-    if (e_shoff != 0 and e_shentsize >= 64 and e_shstrndx < e_shnum) {
-        const str_hdr = @as(usize, @intCast(e_shoff)) + @as(usize, e_shstrndx) * e_shentsize;
-        if (str_hdr + 64 <= bytes.len) {
-            shstr_off = @intCast(try readU64(bytes, str_hdr + 24));
-            shstr_size = @intCast(try readU64(bytes, str_hdr + 32));
+    if (e_shoff != 0 and e_shentsize >= 64 and e_shoff <= bytes.len and e_shstrndx < e_shnum) {
+        const sh_base: usize = @intCast(e_shoff);
+        const str_hdr = sh_base +| (@as(usize, e_shstrndx) *| e_shentsize);
+        if (str_hdr +| 64 <= bytes.len) {
+            const raw_shstr_off = try readU64(bytes, str_hdr + 24);
+            const raw_shstr_sz = try readU64(bytes, str_hdr + 32);
+            if (raw_shstr_off <= bytes.len and raw_shstr_sz <= bytes.len) {
+                shstr_off = @intCast(raw_shstr_off);
+                shstr_size = @intCast(raw_shstr_sz);
+            }
         }
     }
 
-    if (e_shoff != 0 and e_shentsize >= 64) {
+    if (e_shoff != 0 and e_shentsize >= 64 and e_shoff <= bytes.len) {
+        const sh_base: usize = @intCast(e_shoff);
         var si: usize = 0;
         while (si < e_shnum) : (si += 1) {
-            const sh_off = @as(usize, @intCast(e_shoff)) + si * e_shentsize;
-            if (sh_off + 64 > bytes.len) break;
+            const sh_off = sh_base +| (si *| e_shentsize);
+            if (sh_off +| 64 > bytes.len) break;
             const sh_name_idx = try readU32(bytes, sh_off);
             const sh_type = try readU32(bytes, sh_off + 4);
             const sh_flags = try readU64(bytes, sh_off + 8);
@@ -150,16 +163,20 @@ pub fn parseElf(allocator: std.mem.Allocator, bytes: []const u8) !ElfImage {
             const sh_link = try readU32(bytes, sh_off + 40);
 
             var sec_name: [8]u8 = @splat(0);
-            if (shstr_off + sh_name_idx < bytes.len and sh_name_idx < shstr_size) {
-                const rest = bytes[shstr_off + sh_name_idx .. @min(bytes.len, shstr_off + shstr_size)];
-                const nul = std.mem.indexOfScalar(u8, rest, 0) orelse rest.len;
-                const copy_len = @min(nul, 8);
-                @memcpy(sec_name[0..copy_len], rest[0..copy_len]);
+            if (sh_name_idx < shstr_size and shstr_off +| sh_name_idx < bytes.len) {
+                const start = shstr_off + sh_name_idx;
+                const end = @min(bytes.len, shstr_off +| shstr_size);
+                if (start < end) {
+                    const rest = bytes[start..end];
+                    const nul = std.mem.indexOfScalar(u8, rest, 0) orelse rest.len;
+                    const copy_len = @min(nul, 8);
+                    @memcpy(sec_name[0..copy_len], rest[0..copy_len]);
+                }
             }
 
             if ((sh_flags & SHF_ALLOC) != 0 and sh_size > 0) {
                 var chars: u32 = pe.IMAGE_SCN_MEM_READ;
-                if ((sh_flags & SHF_WRITE) != 0) chars |= pe.IMAGE_SCN_MEM_WRITE;
+                if ((sh_flags & SHF_WRITE) != 0 and (sh_flags & SHF_TLS) == 0) chars |= pe.IMAGE_SCN_MEM_WRITE;
                 if ((sh_flags & SHF_EXECINSTR) != 0) chars |= pe.IMAGE_SCN_MEM_EXECUTE;
                 const rva: u32 = if (sh_addr >= base_vaddr)
                     @intCast(@min(sh_addr - base_vaddr, std.math.maxInt(u32)))
@@ -167,54 +184,59 @@ pub fn parseElf(allocator: std.mem.Allocator, bytes: []const u8) !ElfImage {
                     @truncate(sh_addr);
                 try sec_list.append(allocator, .{
                     .name = sec_name,
-                    .virtual_size = @truncate(sh_size),
+                    .virtual_size = @intCast(@min(sh_size, std.math.maxInt(u32))),
                     .virtual_address = rva,
-                    .raw_size = @truncate(sh_size),
-                    .raw_offset = @truncate(sh_offset),
+                    .raw_size = if (sh_type == SHT_NOBITS) 0 else @intCast(@min(sh_size, std.math.maxInt(u32))),
+                    .raw_offset = @intCast(@min(sh_offset, std.math.maxInt(u32))),
                     .characteristics = chars,
                 });
             }
 
             // Parse GNU note properties for BTI/PAC flags
-            if (sh_type == SHT_NOTE and sh_offset + sh_size <= bytes.len) {
-                const note_slice = bytes[@intCast(sh_offset) .. @intCast(sh_offset + sh_size)];
+            if (sh_type == SHT_NOTE and sh_offset <= bytes.len and sh_size <= bytes.len - sh_offset) {
+                const note_start: usize = @intCast(sh_offset);
+                const note_len: usize = @intCast(sh_size);
+                const note_slice = bytes[note_start .. note_start + note_len];
                 var npos: usize = 0;
-                while (npos + 12 <= note_slice.len) {
+                while (npos +| 12 <= note_slice.len) {
                     const namesz = std.mem.readInt(u32, note_slice[npos..][0..4], .little);
                     const descsz = std.mem.readInt(u32, note_slice[npos + 4 ..][0..4], .little);
                     const ntype = std.mem.readInt(u32, note_slice[npos + 8 ..][0..4], .little);
                     const name_aligned = std.mem.alignForward(usize, namesz, 4);
-                    const desc_off = npos + 12 + name_aligned;
+                    const desc_off = npos +| 12 +| name_aligned;
                     const desc_aligned = std.mem.alignForward(usize, descsz, 4);
-                    if (desc_off + descsz > note_slice.len) break;
+                    if (desc_off +| descsz > note_slice.len) break;
                     if (ntype == NT_GNU_PROPERTY_TYPE_0) {
                         var ppos: usize = desc_off;
-                        while (ppos + 8 <= desc_off + descsz) {
+                        while (ppos +| 8 <= desc_off + descsz) {
                             const pr_type = std.mem.readInt(u32, note_slice[ppos..][0..4], .little);
                             const pr_datasz = std.mem.readInt(u32, note_slice[ppos + 4 ..][0..4], .little);
-                            if (ppos + 8 + pr_datasz > desc_off + descsz) break;
+                            if (ppos +| 8 +| pr_datasz > desc_off + descsz) break;
                             if (pr_type == GNU_PROPERTY_AARCH64_FEATURE_1_AND and pr_datasz >= 4) {
                                 const feat = std.mem.readInt(u32, note_slice[ppos + 8 ..][0..4], .little);
                                 if ((feat & GNU_PROPERTY_AARCH64_FEATURE_1_BTI) != 0) has_bti = true;
                                 if ((feat & GNU_PROPERTY_AARCH64_FEATURE_1_PAC) != 0) has_pac = true;
                             }
-                            ppos += 8 + std.mem.alignForward(usize, pr_datasz, 8);
+                            ppos +|= 8 +| std.mem.alignForward(usize, pr_datasz, 8);
                         }
                     }
-                    npos = desc_off + desc_aligned;
+                    npos = desc_off +| desc_aligned;
                 }
             }
 
-            // Parse symbol table for STT_FUNC entries
-            if ((sh_type == SHT_SYMTAB or sh_type == SHT_DYNSYM) and sh_link < e_shnum and sh_offset + sh_size <= bytes.len) {
-                const strtab_hdr = @as(usize, @intCast(e_shoff)) + @as(usize, sh_link) * e_shentsize;
-                if (strtab_hdr + 64 <= bytes.len) {
-                    const str_off: usize = @intCast(try readU64(bytes, strtab_hdr + 24));
-                    const str_sz: usize = @intCast(try readU64(bytes, strtab_hdr + 32));
-                    if (str_off + str_sz <= bytes.len) {
+            // Parse symbol table for STT_FUNC entries (deduplicated across .dynsym & .symtab)
+            if ((sh_type == SHT_SYMTAB or sh_type == SHT_DYNSYM) and sh_link < e_shnum and sh_offset <= bytes.len and sh_size <= bytes.len - sh_offset) {
+                const strtab_hdr = sh_base +| (@as(usize, sh_link) *| e_shentsize);
+                if (strtab_hdr +| 64 <= bytes.len) {
+                    const raw_str_off = try readU64(bytes, strtab_hdr + 24);
+                    const raw_str_sz = try readU64(bytes, strtab_hdr + 32);
+                    if (raw_str_off <= bytes.len and raw_str_sz <= bytes.len - raw_str_off) {
+                        const str_off: usize = @intCast(raw_str_off);
+                        const str_sz: usize = @intCast(raw_str_sz);
                         const num_syms: usize = @intCast(sh_size / 24);
+                        const sym_base: usize = @intCast(sh_offset);
                         for (0..num_syms) |sym_i| {
-                            const sym_off = @as(usize, @intCast(sh_offset)) + sym_i * 24;
+                            const sym_off = sym_base + sym_i * 24;
                             const st_name = try readU32(bytes, sym_off);
                             const st_info = bytes[sym_off + 4];
                             const st_shndx = try readU16(bytes, sym_off + 6);
@@ -225,21 +247,27 @@ pub fn parseElf(allocator: std.mem.Allocator, bytes: []const u8) !ElfImage {
                             if (sym_type == STT_FUNC and st_shndx != 0 and st_size > 0 and st_value >= base_vaddr) {
                                 const begin_rva: u32 = @intCast(@min(st_value - base_vaddr, std.math.maxInt(u32)));
                                 const sz32: u32 = @intCast(@min(st_size, std.math.maxInt(u32)));
-                                try fn_list.append(allocator, .{
-                                    .begin_rva = begin_rva,
-                                    .end_rva = begin_rva +| sz32,
-                                    .unwind_rva = 0,
-                                });
+                                if (!seen_fn_rvas.contains(begin_rva)) {
+                                    try seen_fn_rvas.put(begin_rva, {});
+                                    try fn_list.append(allocator, .{
+                                        .begin_rva = begin_rva,
+                                        .end_rva = begin_rva +| sz32,
+                                        .unwind_rva = 0,
+                                    });
+                                }
                                 if ((sym_bind == STB_GLOBAL or sym_bind == STB_WEAK) and st_name < str_sz) {
                                     const srest = bytes[str_off + st_name .. str_off + str_sz];
                                     const nul = std.mem.indexOfScalar(u8, srest, 0) orelse srest.len;
-                                    if (nul > 0) {
+                                    if (nul > 0 and !seen_exp_names.contains(srest[0..nul])) {
+                                        const dup_name = try allocator.dupe(u8, srest[0..nul]);
+                                        errdefer allocator.free(dup_name);
                                         try exp_list.append(allocator, .{
-                                            .name = try allocator.dupe(u8, srest[0..nul]),
+                                            .name = dup_name,
                                             .rva = begin_rva,
-                                            .ordinal = @intCast(exp_list.items.len),
+                                            .ordinal = @truncate(exp_list.items.len),
                                             .is_forwarded = false,
                                         });
+                                        try seen_exp_names.put(dup_name, {});
                                     }
                                 }
                             }

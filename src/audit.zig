@@ -116,10 +116,11 @@ pub fn analyzeArm64Binary(allocator: std.mem.Allocator, bytes: []const u8) !Audi
         const raw_off: usize = text_sec.raw_offset;
         if (raw_off < bytes.len and text_sec.raw_size > 0) {
             const avail = @min(@as(usize, text_sec.raw_size), bytes.len - raw_off);
-            const code = bytes[raw_off .. raw_off + avail];
             const span: u32 = if (text_sec.virtual_size == 0) text_sec.raw_size else @min(text_sec.virtual_size, text_sec.raw_size);
+            const code_len = @min(avail, @as(usize, span));
+            const code = bytes[raw_off .. raw_off + code_len];
             const text_begin = text_sec.virtual_address;
-            const text_end = text_begin + @min(span, @as(u32, @intCast(avail)));
+            const text_end = text_begin +| @as(u32, @intCast(code_len));
 
             if (img.isArm64()) {
                 const zones = try arm64_isa.findExclusiveZones(allocator, code, text_begin);
@@ -183,8 +184,10 @@ pub fn analyzeArm64Binary(allocator: std.mem.Allocator, bytes: []const u8) !Audi
                     }
                 }
                 const score = f_bbs.len * 10 + branch_cnt * 3;
+                const dup_name = try allocator.dupe(u8, exp.name);
+                errdefer allocator.free(dup_name);
                 try cand_list.append(allocator, .{
-                    .name = try allocator.dupe(u8, exp.name),
+                    .name = dup_name,
                     .rva = exp.rva,
                     .bb_count = f_bbs.len,
                     .branch_count = branch_cnt,

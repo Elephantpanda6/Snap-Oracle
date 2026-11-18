@@ -136,6 +136,7 @@ pub fn main(init: std.process.Init) !void {
                 iters,
                 jobs,
                 corpus_dir,
+                dict_path,
                 max_input,
                 laptop_profile,
                 bti_safe,

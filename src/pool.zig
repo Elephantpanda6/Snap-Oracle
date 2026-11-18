@@ -13,6 +13,7 @@ pub fn runPoolFuzz(
     total_iters: usize,
     jobs: usize,
     corpus_dir: ?[]const u8,
+    dict_path: ?[]const u8,
     max_input: usize,
     laptop_profile: ?[]const u8,
     bti_safe: bool,
@@ -36,11 +37,14 @@ pub fn runPoolFuzz(
     const max_in_str = try std.fmt.allocPrint(allocator, "{d}", .{max_input});
     defer allocator.free(max_in_str);
 
-    var children = try allocator.alloc(std.process.Child, worker_count);
+    const children = try allocator.alloc(std.process.Child, worker_count);
     defer allocator.free(children);
-    var seed_strs = try allocator.alloc([]u8, worker_count);
+    const seed_strs = try allocator.alloc([]u8, worker_count);
+    @memset(seed_strs, &.{});
     defer {
-        for (seed_strs) |s| allocator.free(s);
+        for (seed_strs) |s| {
+            if (s.len > 0) allocator.free(s);
+        }
         allocator.free(seed_strs);
     }
 
@@ -53,7 +57,7 @@ pub fn runPoolFuzz(
 
     for (0..worker_count) |idx| {
         seed_strs[idx] = try std.fmt.allocPrint(allocator, "{d}", .{@as(u64, 0x9E37_79B9_7F4A_7C15) +% (@as(u64, idx) *% 0xBF58_476D_1CE4_E5B9)});
-        var argv_buf: [18][]const u8 = undefined;
+        var argv_buf: [24][]const u8 = undefined;
         var argc: usize = 0;
         argv_buf[argc] = exe_path;
         argc += 1;
@@ -83,6 +87,18 @@ pub fn runPoolFuzz(
         argc += 1;
         argv_buf[argc] = seed_strs[idx];
         argc += 1;
+        if (dict_path) |dp| {
+            argv_buf[argc] = "--dict";
+            argc += 1;
+            argv_buf[argc] = dp;
+            argc += 1;
+        }
+        if (laptop_profile) |lp| {
+            argv_buf[argc] = "--laptop";
+            argc += 1;
+            argv_buf[argc] = lp;
+            argc += 1;
+        }
         if (bti_safe) {
             argv_buf[argc] = "--bti-safe";
             argc += 1;

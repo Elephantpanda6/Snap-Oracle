@@ -55,7 +55,7 @@ pub const Corpus = struct {
         var loaded: usize = 0;
         while (it.next(io) catch null) |entry| {
             if (entry.kind != .file) continue;
-            const data = dir.readFileAlloc(io, entry.name, self.allocator, .limited(self.max_seed_bytes)) catch continue;
+            const data = dir.readFileAlloc(io, entry.name, self.allocator, .limited(@max(self.max_seed_bytes, 1024 * 1024))) catch continue;
             defer self.allocator.free(data);
 
             if (try self.addSeed(data, 0)) {

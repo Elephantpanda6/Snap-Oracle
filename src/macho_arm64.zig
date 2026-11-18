@@ -100,7 +100,7 @@ pub fn parseMachO(allocator: std.mem.Allocator, bytes: []const u8) !MachoImage {
             const segname = bytes[cmd_off + 8 .. cmd_off + 24];
             const vmaddr = try readU64(bytes, cmd_off + 24);
             const vmsz = try readU64(bytes, cmd_off + 32);
-            const maxprot = try readU32(bytes, cmd_off + 56);
+            const initprot = try readU32(bytes, cmd_off + 60);
             const nsects = try readU32(bytes, cmd_off + 64);
 
             if (std.mem.startsWith(u8, segname, "__TEXT")) {
@@ -125,7 +125,7 @@ pub fn parseMachO(allocator: std.mem.Allocator, bytes: []const u8) !MachoImage {
                 const flags = try readU32(bytes, sec_off + 64);
 
                 var chars: u32 = pe.IMAGE_SCN_MEM_READ;
-                if ((maxprot & 2) != 0 and !std.mem.startsWith(u8, segname, "__TEXT")) {
+                if ((initprot & 2) != 0 and !std.mem.startsWith(u8, segname, "__TEXT") and !std.mem.startsWith(u8, sectname, "__const")) {
                     chars |= pe.IMAGE_SCN_MEM_WRITE;
                 }
                 if ((flags & 0x8000_0000) != 0 or std.mem.startsWith(u8, sectname, "__text")) {
@@ -158,7 +158,7 @@ pub fn parseMachO(allocator: std.mem.Allocator, bytes: []const u8) !MachoImage {
             const nsyms = try readU32(bytes, cmd_off + 12);
             const stroff = try readU32(bytes, cmd_off + 16);
             const strsize = try readU32(bytes, cmd_off + 20);
-            if (@as(usize, stroff) + strsize <= bytes.len and @as(usize, symoff) + @as(usize, nsyms) * 16 <= bytes.len) {
+            if (@as(usize, stroff) +| strsize <= bytes.len and @as(usize, symoff) +| @as(usize, nsyms) *| 16 <= bytes.len) {
                 for (0..nsyms) |si| {
                     const nl = @as(usize, symoff) + si * 16;
                     const strx = try readU32(bytes, nl);
@@ -170,10 +170,12 @@ pub fn parseMachO(allocator: std.mem.Allocator, bytes: []const u8) !MachoImage {
                         const nul = std.mem.indexOfScalar(u8, srest, 0) orelse srest.len;
                         if (nul > 0) {
                             const rva: u32 = @intCast(@min(n_value - text_base_vm, std.math.maxInt(u32)));
+                            const dup_name = try allocator.dupe(u8, srest[0..nul]);
+                            errdefer allocator.free(dup_name);
                             try exp_list.append(allocator, .{
-                                .name = try allocator.dupe(u8, srest[0..nul]),
+                                .name = dup_name,
                                 .rva = rva,
-                                .ordinal = @intCast(exp_list.items.len),
+                                .ordinal = @truncate(exp_list.items.len),
                                 .is_forwarded = false,
                             });
                         }
@@ -185,7 +187,7 @@ pub fn parseMachO(allocator: std.mem.Allocator, bytes: []const u8) !MachoImage {
         cmd_off += cmdsize;
     }
 
-    if (fn_starts_off != 0 and fn_starts_sz != 0 and @as(usize, fn_starts_off) + fn_starts_sz <= bytes.len) {
+    if (fn_starts_off != 0 and fn_starts_sz != 0 and @as(usize, fn_starts_off) +| fn_starts_sz <= bytes.len) {
         const fs = bytes[fn_starts_off .. fn_starts_off + fn_starts_sz];
         var pos: usize = 0;
         var cur: u64 = 0;
@@ -194,11 +196,11 @@ pub fn parseMachO(allocator: std.mem.Allocator, bytes: []const u8) !MachoImage {
         while (pos < fs.len) {
             const delta = readUleb128(fs, &pos) orelse break;
             if (delta == 0) break;
-            cur += delta;
+            cur +|= delta;
             try starts.append(allocator, @truncate(cur));
         }
         for (starts.items, 0..) |st, idx| {
-            const end_rva = if (idx + 1 < starts.items.len) starts.items[idx + 1] else @max(st + 4, text_end_rva);
+            const end_rva = if (idx + 1 < starts.items.len) starts.items[idx + 1] else @max(st +| 4, text_end_rva);
             try fn_list.append(allocator, .{
                 .begin_rva = st,
                 .end_rva = end_rva,

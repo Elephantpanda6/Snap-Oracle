@@ -51,7 +51,8 @@ pub fn minimizeCrashIsolated(
 
             if (reset_fn) |rf| rf(reset_ctx);
             const res = veh.runProtected(func, cand.ptr, cand_len);
-            if (res.crashed and res.exception_code == expected_code) {
+            const same_rva = initial.fault_rva == 0 or res.fault_rva == initial.fault_rva;
+            if (res.crashed and res.exception_code == expected_code and same_rva) {
                 @memcpy(buf[0..cand_len], cand[0..cand_len]);
                 len = cand_len;
             } else {
@@ -76,7 +77,8 @@ pub fn minimizeCrashIsolated(
 
             if (reset_fn) |rf| rf(reset_ctx);
             const res = veh.runProtected(func, cand.ptr, cand_len);
-            if (res.crashed and res.exception_code == expected_code) {
+            const same_rva = initial.fault_rva == 0 or res.fault_rva == initial.fault_rva;
+            if (res.crashed and res.exception_code == expected_code and same_rva) {
                 @memcpy(buf[0..cand_len], cand[0..cand_len]);
                 len = cand_len;
                 progress = true;

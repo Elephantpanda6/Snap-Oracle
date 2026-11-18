@@ -221,12 +221,22 @@ pub const ALL_PROFILES = [_]LaptopProfile{
     },
 };
 
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0 or needle.len > haystack.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return true;
+    }
+    return false;
+}
+
 pub fn findProfile(query: []const u8) ?LaptopProfile {
+    if (query.len == 0) return null;
     for (ALL_PROFILES) |p| {
         if (std.ascii.eqlIgnoreCase(p.id, query)) return p;
     }
     for (ALL_PROFILES) |p| {
-        if (std.mem.indexOf(u8, p.id, query) != null or std.mem.indexOf(u8, p.name, query) != null) return p;
+        if (containsIgnoreCase(p.id, query) or containsIgnoreCase(p.name, query)) return p;
     }
     return null;
 }
