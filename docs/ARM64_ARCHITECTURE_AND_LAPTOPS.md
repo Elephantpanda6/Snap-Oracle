@@ -54,4 +54,25 @@ Yet security tooling, binary fuzzers, and ABI verification tools still lag behin
 1. **TCP / SSH Remote `diff` Bridge**: Extend `worker` stdio framing with a lightweight TCP listener so an x64 developer workstation can drive live `snap-oracle diff` directly against a Snapdragon X Elite or NVIDIA N1X laptop on the local LAN.
 2. **ARM64 Hardware Performance Counters & MTE Tagging**: Expose ARMv9 Memory Tagging Extension (`MTE`) synchronous tag-check fault reporting (`SIGSEGV` `SEGV_MTESERR`) on Snapdragon X2, NVIDIA N1X, and MediaTek ARMv9 Linux kernels for deterministic heap UAF detection without ASan recompilation.
 3. **Hyper-V / KVM L2 Micro-VM Fallback**: Wrap targets that spawn child threads or kernel handles inside a lightweight Hyper-V / KVM snapshot loop while keeping L1 in-process speed (`150k–700k exec/s`) for pure parser targets.
-4. **ARM64EC Thunk & Guest-Exit Tracer**: Extend `pe.zig` + `cfg.zig` to correlate `CHPE` / `ARM64EC` redirection metadata tables (`__os_arm64x_dispatch_call`) during hybrid x64-emulated + ARM64-native DLL fuzzing on Windows.
+4. **ARM64EC Thunk & Guest-Exit Tracer**: Inspects `CHPEMetadataPointer` and `#`-prefixed ARM64EC decorated thunks in `src/imports.zig` alongside `pe.zig` `.a64xrm` detection.
+
+## Enterprise Commercial & DevSecOps Modules (Added in v0.3.0-enterprise-arm64)
+
+| Module | CLI Subcommand | Commercial Enterprise Purpose |
+|---|---|---|
+| `src/finding.zig` + `src/report.zig` | `report`, `--format sarif\|json\|junit\|gha` | GitHub Code Scanning SARIF 2.1.0, Jenkins JUnit, deterministic FNV-1a finding fingerprints |
+| `src/imports.zig` | `deps` | PE/ARM64EC/ELF/Mach-O dependency closure & mixed-arch loadability check (`SO-DEP-001`..`004`) |
+| `src/pagesize.zig` | `pagesize` | 4K/16K/64K kernel readiness (`p_align`, ELF mmap congruence, W^X boundary overlap, `0x1000` constants) |
+| `src/hardening.zig` | `harden` | PE CFG/ASLR/NX + PAC/BTI prologue ratio; ELF PIE/RELRO/NX/`TEXTREL`/MTE; Mach-O `CS_RUNTIME`/PIE |
+| `src/sbom.zig` | `sbom` | CycloneDX 1.5 & SPDX 2.3 JSON SBOM, embedded library fingerprinting, RSDS/Rich/GNU build-id/LC_UUID |
+| `src/perfadvisor.zig` | `perf-advise` | Scalar FP back-edge loops, LL/SC vs LSE contention, DotProd/I8MM/BF16 gaps, x64 VEX/EVEX translation |
+| `src/portscan.zig` | `portscan` | Comment/literal-safe C/C++/Rust/Zig source & binary porting scanner (`_mm_*`, `__rdtsc`, weak-memory `volatile`, `char`) |
+| `src/crash_triage.zig` | `triage` | Defensive CWE root-cause classification (`pac_auth_fail`, `wild_write`, `null_deref`, input taint check) |
+| `src/harnessgen.zig` | `gen harness\|repro` | Ready-to-compile C, Zig, Rust (`cargo-fuzz`), and Python reproducers & harnesses |
+| `src/cmin.zig` | `cmin` | Exact basic-block weighted set-cover seed distillation + delta-debugging `--tmin` |
+| `src/covreport.zig` | `cov` | Binary DrCov v2 (IDA/Ghidra/Binary Ninja Lighthouse), LCOV, JSON diff, self-contained HTML grid |
+| `src/symbols.zig` | `sym` | Unified PE `.pdata`/COFF/exports, ELF symtab, Mach-O symbols, Itanium/MSVC demangler, DWARF `.debug_line` |
+| `src/bench.zig` | `bench` | Hardware fleet microbenchmarks (`decode`, `cfg`, `mutate`, `snapshot`, `exec`) with median/p95/MAD regression gate |
+| `src/crashdb.zig` | `crashdb`, `baseline` | CRC32-verified persistent JSONL database & legacy finding suppression (`--baseline`) |
+| `src/ci_gate.zig` | `ci init\|gate` | Native ARM64 CI workflow templates & expiring ISO-date waiver policy enforcement |
+| `src/license.zig` | `license` | Offline Ed25519 commercial license verification + authorized-use & non-liability enforcement |

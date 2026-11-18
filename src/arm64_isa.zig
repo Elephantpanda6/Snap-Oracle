@@ -374,6 +374,77 @@ pub fn isRvaInExclusiveZone(zones: []const ExclusiveZone, rva: u32) bool {
     return false;
 }
 
+pub const ComputeExt = enum {
+    none,
+    dotprod,
+    i8mm,
+    bf16,
+    crypto_aes,
+    crypto_sha,
+    crc32,
+    fcma,
+};
+
+/// Classify ARMv8.2–v8.6 compute/crypto/AI accelerator instructions (`SDOT`, `SMMLA`, `BFDOT`, AES, SHA, CRC32, FCMLA).
+pub fn classifyComputeExt(insn: u32) ComputeExt {
+    // DotProd: SDOT/UDOT vector and indexed
+    if ((insn & 0x9FE0_FC00) == 0x0E80_9400 or (insn & 0x9F00_F400) == 0x0F00_E000) {
+        return .dotprod;
+    }
+    // Int8 Matrix Multiply: SMMLA/UMMLA/USMMLA
+    if ((insn & 0x9FE0_FC00) == 0x0E80_A400 or (insn & 0xBFE0_FC00) == 0x4E80_AC00) {
+        return .i8mm;
+    }
+    // BFloat16: BFMMLA/BFDOT
+    if ((insn & 0xFFE0_FC00) == 0x6E40_EC00 or (insn & 0xBFE0_FC00) == 0x2E40_FC00 or (insn & 0xBF00_F400) == 0x2F40_F000) {
+        return .bf16;
+    }
+    // AES: AESE/AESD/AESMC/AESIMC
+    if ((insn & 0xFFFF_CC00) == 0x4E28_4800) {
+        return .crypto_aes;
+    }
+    // SHA-1 / SHA-256 / SHA-512
+    if ((insn & 0xFF20_8C00) == 0x5E00_0000 or (insn & 0xFFFF_CC00) == 0x5E28_0800 or (insn & 0xFFE0_FC00) == 0xCE60_8000) {
+        return .crypto_sha;
+    }
+    // CRC32 / CRC32C
+    if ((insn & 0x7FE0_EC00) == 0x1AC0_4000) {
+        return .crc32;
+    }
+    // Complex floating-point: FCADD / FCMLA
+    if ((insn & 0xBF20_C400) == 0x2E00_C400) {
+        return .fcma;
+    }
+    return .none;
+}
+
+/// Detect likely hardcoded 4KB (0x1000 / 0xFFF) page-size constants or page-offset bitmasks
+/// in AArch64 instructions (MOVZ/MOVK, ADD/SUB/CMP imm12, AND/TST logical immediate).
+pub fn isHardcoded4kPageImm(insn: u32) bool {
+    const d = decode(insn);
+    if (d.class == .mov_wide and (d.imm == 0x1000 or d.imm == 0xFFF)) {
+        return true;
+    }
+    // ADD / ADDS / SUB / SUBS (including CMP/CMN alias) immediate: op 100010 sh imm12
+    if ((insn & 0x1F00_0000) == 0x1100_0000) {
+        const sh = (insn >> 22) & 1;
+        const imm12 = (insn >> 10) & 0xFFF;
+        if (sh == 0 and imm12 == 0xFFF) return true;
+        if (sh == 1 and imm12 == 1) return true; // #1, lsl #12 == 0x1000
+    }
+    // Logical immediate (AND/ORR/EOR/ANDS/TST): bits [28:23] == 100100
+    if ((insn & 0x1F80_0000) == 0x1200_0000) {
+        const n = (insn >> 22) & 1;
+        const immr = (insn >> 16) & 0x3F;
+        const imms = (insn >> 10) & 0x3F;
+        // 64-bit #0xFFF (N=1, immr=0, imms=11) or #~0xFFF (N=1, immr=52, imms=51)
+        if (n == 1 and ((immr == 0 and imms == 11) or (immr == 52 and imms == 51))) return true;
+        // 32-bit #0xFFF (N=0, immr=0, imms=11) or #0xFFFFF000 (N=0, immr=20, imms=19)
+        if (n == 0 and ((immr == 0 and imms == 11) or (immr == 20 and imms == 19))) return true;
+    }
+    return false;
+}
+
 test "arm64_isa decodes branches, BTI, PAC, LSE, NEON, MOVZ/CMP" {
     try std.testing.expectEqual(InsnClass.nop, decode(0xD503_201F).class);
     try std.testing.expectEqual(InsnClass.bti, decode(0xD503_245F).class); // bti c

@@ -100,6 +100,8 @@ pub const FuzzOptions = struct {
     target_path: []const u8,
     entry_name: []const u8 = "fuzz_entry",
     iters: usize = 1000,
+    max_execs: u64 = 0,
+    max_seconds: u64 = 0,
     corpus_dir: ?[]const u8 = null,
     dict_path: ?[]const u8 = null,
     max_input: usize = 4096,
@@ -213,9 +215,14 @@ pub fn runFuzzEx(io: std.Io, allocator: std.mem.Allocator, opts: FuzzOptions) !v
     );
 
     const t0 = std.Io.Timestamp.now(io, .awake);
+    const max_iter_limit: usize = if (opts.max_execs > 0) @intCast(opts.max_execs) else opts.iters;
+    const deadline_ns: i96 = if (opts.max_seconds > 0) t0.nanoseconds + @as(i96, @intCast(opts.max_seconds)) * 1_000_000_000 else 0;
 
     var i: usize = 0;
-    while (i < opts.iters) : (i += 1) {
+    while (i < max_iter_limit) : (i += 1) {
+        if (deadline_ns > 0 and (i & 1023) == 1023) {
+            if (std.Io.Timestamp.now(io, .awake).nanoseconds >= deadline_ns) break;
+        }
         const seed = corp.pickWeighted(&rng);
         const n = @min(seed.len, max_input);
         const pad = @min(rng.below(9), max_input - n);
@@ -258,13 +265,13 @@ pub fn runFuzzEx(io: std.Io, allocator: std.mem.Allocator, opts: FuzzOptions) !v
 
     const t1 = std.Io.Timestamp.now(io, .awake);
     const elapsed_ms: u64 = @intCast(@max(@divFloor(t1.nanoseconds - t0.nanoseconds, 1_000_000), 1));
-    const exec_per_sec: u64 = @intCast((@as(u128, opts.iters) * 1000) / elapsed_ms);
+    const exec_per_sec: u64 = @intCast((@as(u128, i) * 1000) / elapsed_ms);
     std.debug.print(
         "[fuzz] target={s} entry={s} iters={d} elapsed_ms={d} exec_per_sec={d} edges={d}/{d} corpus={d} (loaded={d}) crashes={d} (unique={d}) dirty_pages_reset={d}\n",
         .{
             opts.target_path,
             opts.entry_name,
-            opts.iters,
+            i,
             elapsed_ms,
             exec_per_sec,
             bp_table.hitCount(),

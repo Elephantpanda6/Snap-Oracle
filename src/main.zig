@@ -6,6 +6,23 @@ const audit = @import("audit.zig");
 const arm_laptops = @import("arm_laptops.zig");
 const worker = @import("worker.zig");
 const pool = @import("pool.zig");
+const finding = @import("finding.zig");
+const report = @import("report.zig");
+const symbols = @import("symbols.zig");
+const license = @import("license.zig");
+const imports = @import("imports.zig");
+const pagesize = @import("pagesize.zig");
+const hardening = @import("hardening.zig");
+const sbom = @import("sbom.zig");
+const perfadvisor = @import("perfadvisor.zig");
+const portscan = @import("portscan.zig");
+const crash_triage = @import("crash_triage.zig");
+const harnessgen = @import("harnessgen.zig");
+const cmin = @import("cmin.zig");
+const covreport = @import("covreport.zig");
+const bench = @import("bench.zig");
+const crashdb = @import("crashdb.zig");
+const ci_gate = @import("ci_gate.zig");
 
 fn getFlag(args: []const []const u8, name: []const u8) ?[]const u8 {
     var i: usize = 0;
@@ -24,21 +41,43 @@ fn hasFlag(args: []const []const u8, name: []const u8) bool {
 
 fn printUsage() void {
     std.debug.print(
-        \\snap-oracle (ARM64-First Cross-OS Snapshot Fuzzer & Binary Auditor)
+        \\{s} {s} (ARM64-First Cross-OS Security Gate, Auditor & Snapshot Fuzzer)
+        \\Authorized Defensive & QA Testing Use Only. See LICENSE for Commercial Terms.
         \\
-        \\Usage:
-        \\  snap-oracle inspect  <binary>                 Parse PE32+/ELF64/Mach-O headers, functions & BBs
-        \\  snap-oracle audit    <binary>                 ARM64 readiness, PAC/BTI/LSE, laptop matrix & exports
-        \\  snap-oracle hwinfo                            Probe live host ARM64 ISA/page-size/laptop profile
-        \\  snap-oracle profiles                          List all supported ARM64 laptop & workstation profiles
-        \\  snap-oracle fuzz     --target <bin> [--entry <fn>] [--iters N] [--corpus <dir>]
-        \\                       [--max-input N] [--seed N] [--dict <file>] [--laptop <id>]
-        \\                       [--jobs N] [--bti-safe]
-        \\  snap-oracle diff     [--a <bin1> --b <bin2> | --x64 <bin1> --arm64 <bin2>] [--entry <fn>] [--iters N]
-        \\  snap-oracle replay   --target <bin> [--entry <fn>] --input <file> [--minimize]
-        \\  snap-oracle worker   --target <bin> [--entry <fn>] [--bti-safe]
+        \\Core Discovery & Hardware:
+        \\  snap-oracle inspect     <binary>                      Parse PE32+/ELF64/Mach-O headers & BBs
+        \\  snap-oracle audit       <binary> [--format ...]       ARM64 readiness, PAC/BTI/LSE, SARIF/JSON
+        \\  snap-oracle sym         <binary> [rva_hex...]         Resolve symbols, demangle C++ & DWARF files
+        \\  snap-oracle hwinfo                                    Probe live host ARM64 ISA/page-size/profile
+        \\  snap-oracle profiles                                  List supported ARM64 laptop/server profiles
         \\
-    , .{});
+        \\Enterprise ARM64 Compliance & Porting:
+        \\  snap-oracle deps        <binary> [--root dir]         PE/ARM64EC/ELF/Mach-O ABI dependency graph
+        \\  snap-oracle pagesize    <binary> [--fix-hints]        4K/16K/64K kernel page-size readiness audit
+        \\  snap-oracle harden      <binary> [--level strict]     PAC/BTI/CFG/RELRO/PIE/Codesign/MTE audit
+        \\  snap-oracle sbom        <binary> [--format cyclonedx|spdx|text]  SBOM & build provenance
+        \\  snap-oracle perf-advise <binary> [--profile id]       Scalar FP loops, LL/SC vs LSE, DotProd/AVX
+        \\  snap-oracle portscan    <dir|src|bin> [--format ...]  x64->ARM64 C/C++/Rust/Zig & binary scanner
+        \\
+        \\Fuzzing, Coverage & Crash Triage:
+        \\  snap-oracle fuzz        --target <bin> [--iters N] [--max-execs N] [--duration sec] [--jobs N]
+        \\  snap-oracle diff        [--a <bin1> --b <bin2>] [--entry <fn>] [--iters N]
+        \\  snap-oracle replay      --target <bin> --input <file> [--minimize]
+        \\  snap-oracle triage      --target <bin> (--input <file> | --crash-dir <dir>) [--format sarif|json]
+        \\  snap-oracle cmin        --target <bin> --corpus <in> --out <out> [--tmin]
+        \\  snap-oracle cov         --target <bin> [--corpus <dir>] --format html|json|lcov|drcov --out <file>
+        \\  snap-oracle gen         <harness|repro> --target <bin> [--input <crash>] --lang c|zig|rust|py
+        \\  snap-oracle bench       [--suite all|decode|cfg|mutate|snapshot|exec] [--json out]
+        \\  snap-oracle worker      --target <bin> [--entry <fn>] [--bti-safe]
+        \\
+        \\DevSecOps CI/CD & Licensing:
+        \\  snap-oracle report      convert <in.json> --format sarif|junit|gha|json|text
+        \\  snap-oracle crashdb     <init|add|list|stats> [--db path] [--report json]
+        \\  snap-oracle baseline    <create|diff> --report <json> [--baseline base.json]
+        \\  snap-oracle ci          <init|gate> [--provider github|gitlab|azdo|jenkins]
+        \\  snap-oracle license     <status|terms|verify <file>|keygen-demo>
+        \\
+    , .{ finding.TOOL_NAME, finding.TOOL_VERSION });
 }
 
 fn cmdInspect(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !void {
@@ -79,7 +118,7 @@ fn cmdInspect(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !void 
     }
 }
 
-pub fn main(init: std.process.Init) !void {
+pub fn main(init: std.process.Init) !u8 {
     const allocator = std.heap.c_allocator;
 
     var args_list = std.ArrayList([]const u8).empty;
@@ -93,38 +132,91 @@ pub fn main(init: std.process.Init) !void {
 
     if (args.len < 2) {
         printUsage();
-        return;
+        return 0;
     }
 
     const sub = args[1];
-    if (std.mem.eql(u8, sub, "inspect") and args.len >= 3) {
-        try cmdInspect(init.io, allocator, args[2]);
-    } else if (std.mem.eql(u8, sub, "audit") and args.len >= 3) {
-        try audit.runAuditCommand(init.io, allocator, args[2]);
+    const rest = args[2..];
+
+    if (std.mem.eql(u8, sub, "help") or std.mem.eql(u8, sub, "--help") or std.mem.eql(u8, sub, "-h")) {
+        printUsage();
+        return 0;
+    } else if (std.mem.eql(u8, sub, "inspect") and rest.len >= 1) {
+        try cmdInspect(init.io, allocator, rest[0]);
+        return 0;
+    } else if (std.mem.eql(u8, sub, "audit")) {
+        return try audit.runAuditCommandEx(init.io, allocator, rest);
     } else if (std.mem.eql(u8, sub, "hwinfo")) {
         arm_laptops.printHostInfo();
+        return 0;
     } else if (std.mem.eql(u8, sub, "profiles")) {
         arm_laptops.printAllProfiles();
+        return 0;
+    } else if (std.mem.eql(u8, sub, "deps")) {
+        return try imports.runDepsCommand(init.io, allocator, rest);
+    } else if (std.mem.eql(u8, sub, "pagesize")) {
+        return try pagesize.runPagesizeCommand(init.io, allocator, rest);
+    } else if (std.mem.eql(u8, sub, "harden")) {
+        return try hardening.runHardenCommand(init.io, allocator, rest);
+    } else if (std.mem.eql(u8, sub, "sbom")) {
+        try sbom.runSbomCommand(init.io, allocator, rest);
+        return 0;
+    } else if (std.mem.eql(u8, sub, "perf-advise")) {
+        return try perfadvisor.runPerfAdviseCommand(init.io, allocator, rest);
+    } else if (std.mem.eql(u8, sub, "portscan")) {
+        return try portscan.runPortscanCommand(init.io, allocator, rest);
+    } else if (std.mem.eql(u8, sub, "triage")) {
+        return try crash_triage.runTriageCommand(init.io, allocator, rest);
+    } else if (std.mem.eql(u8, sub, "gen")) {
+        try harnessgen.runGenCommand(init.io, allocator, rest);
+        return 0;
+    } else if (std.mem.eql(u8, sub, "cmin")) {
+        try cmin.runCminCommand(init.io, allocator, rest);
+        return 0;
+    } else if (std.mem.eql(u8, sub, "cov")) {
+        try covreport.runCovCommand(init.io, allocator, rest);
+        return 0;
+    } else if (std.mem.eql(u8, sub, "bench")) {
+        return try bench.runBenchCommand(init.io, allocator, rest);
+    } else if (std.mem.eql(u8, sub, "crashdb")) {
+        try crashdb.runCrashDbCommand(init.io, allocator, rest);
+        return 0;
+    } else if (std.mem.eql(u8, sub, "baseline")) {
+        return try crashdb.runBaselineCommand(init.io, allocator, rest);
+    } else if (std.mem.eql(u8, sub, "ci")) {
+        return try ci_gate.runCiCommand(init.io, allocator, rest);
+    } else if (std.mem.eql(u8, sub, "sym")) {
+        try symbols.runSymCommand(init.io, allocator, rest);
+        return 0;
+    } else if (std.mem.eql(u8, sub, "report")) {
+        try report.runReportCommand(init.io, allocator, rest);
+        return 0;
+    } else if (std.mem.eql(u8, sub, "license")) {
+        return try license.runLicenseCommand(init.io, allocator, rest);
     } else if (std.mem.eql(u8, sub, "fuzz")) {
-        const target = getFlag(args[2..], "--target") orelse {
+        const target = getFlag(rest, "--target") orelse {
             printUsage();
-            return;
+            return 2;
         };
-        const entry = getFlag(args[2..], "--entry") orelse "fuzz_entry";
-        const iters_str = getFlag(args[2..], "--iters") orelse "1000";
+        const entry = getFlag(rest, "--entry") orelse "fuzz_entry";
+        const iters_str = getFlag(rest, "--iters") orelse "1000";
         const iters = std.fmt.parseInt(usize, iters_str, 10) catch 1000;
-        const corpus_dir = getFlag(args[2..], "--corpus");
-        const dict_path = getFlag(args[2..], "--dict");
-        const max_in_str = getFlag(args[2..], "--max-input") orelse "4096";
+        const max_execs_str = getFlag(rest, "--max-execs") orelse "0";
+        const max_execs = std.fmt.parseInt(u64, max_execs_str, 10) catch 0;
+        const dur_str = getFlag(rest, "--duration") orelse "0";
+        const max_seconds = std.fmt.parseInt(u64, dur_str, 10) catch 0;
+        const corpus_dir = getFlag(rest, "--corpus");
+        const dict_path = getFlag(rest, "--dict");
+        const max_in_str = getFlag(rest, "--max-input") orelse "4096";
         const max_input = std.fmt.parseInt(usize, max_in_str, 10) catch 4096;
-        const seed_opt: ?u64 = if (getFlag(args[2..], "--seed")) |s|
+        const seed_opt: ?u64 = if (getFlag(rest, "--seed")) |s|
             std.fmt.parseInt(u64, s, 0) catch null
         else
             null;
-        const jobs_str = getFlag(args[2..], "--jobs") orelse "1";
+        const jobs_str = getFlag(rest, "--jobs") orelse "1";
         const jobs = std.fmt.parseInt(usize, jobs_str, 10) catch 1;
-        const laptop_profile = getFlag(args[2..], "--laptop");
-        const bti_safe = hasFlag(args[2..], "--bti-safe");
+        const laptop_profile = getFlag(rest, "--laptop");
+        const bti_safe = hasFlag(rest, "--bti-safe");
 
         if (jobs > 1) {
             try pool.runPoolFuzz(
@@ -133,7 +225,7 @@ pub fn main(init: std.process.Init) !void {
                 args[0],
                 target,
                 entry,
-                iters,
+                if (max_execs > 0) @intCast(max_execs) else iters,
                 jobs,
                 corpus_dir,
                 dict_path,
@@ -146,6 +238,8 @@ pub fn main(init: std.process.Init) !void {
                 .target_path = target,
                 .entry_name = entry,
                 .iters = iters,
+                .max_execs = max_execs,
+                .max_seconds = max_seconds,
                 .corpus_dir = corpus_dir,
                 .dict_path = dict_path,
                 .max_input = max_input,
@@ -154,40 +248,45 @@ pub fn main(init: std.process.Init) !void {
                 .bti_safe = bti_safe,
             });
         }
+        return 0;
     } else if (std.mem.eql(u8, sub, "diff")) {
-        const bin_a = getFlag(args[2..], "--a") orelse getFlag(args[2..], "--x64") orelse {
+        const bin_a = getFlag(rest, "--a") orelse getFlag(rest, "--x64") orelse {
             printUsage();
-            return;
+            return 2;
         };
-        const bin_b = getFlag(args[2..], "--b") orelse getFlag(args[2..], "--arm64") orelse {
+        const bin_b = getFlag(rest, "--b") orelse getFlag(rest, "--arm64") orelse {
             printUsage();
-            return;
+            return 2;
         };
-        const entry = getFlag(args[2..], "--entry") orelse "fuzz_entry";
-        const iters_str = getFlag(args[2..], "--iters") orelse "1000";
+        const entry = getFlag(rest, "--entry") orelse "fuzz_entry";
+        const iters_str = getFlag(rest, "--iters") orelse "1000";
         const iters = std.fmt.parseInt(usize, iters_str, 10) catch 1000;
         try runner.runDiff(init.io, allocator, bin_a, bin_b, entry, iters);
+        return 0;
     } else if (std.mem.eql(u8, sub, "replay")) {
-        const target = getFlag(args[2..], "--target") orelse {
+        const target = getFlag(rest, "--target") orelse {
             printUsage();
-            return;
+            return 2;
         };
-        const entry = getFlag(args[2..], "--entry") orelse "fuzz_entry";
-        const input = getFlag(args[2..], "--input") orelse {
+        const entry = getFlag(rest, "--entry") orelse "fuzz_entry";
+        const input = getFlag(rest, "--input") orelse {
             printUsage();
-            return;
+            return 2;
         };
-        const minimize = hasFlag(args[2..], "--minimize");
+        const minimize = hasFlag(rest, "--minimize");
         try runner.runReplay(init.io, allocator, target, entry, input, minimize);
+        return 0;
     } else if (std.mem.eql(u8, sub, "worker")) {
-        const target = getFlag(args[2..], "--target") orelse {
+        const target = getFlag(rest, "--target") orelse {
             printUsage();
-            return;
+            return 2;
         };
-        const entry = getFlag(args[2..], "--entry") orelse "fuzz_entry";
-        const bti_safe = hasFlag(args[2..], "--bti-safe");
+        const entry = getFlag(rest, "--entry") orelse "fuzz_entry";
+        const bti_safe = hasFlag(rest, "--bti-safe");
         try worker.runWorkerStdio(init.io, allocator, target, entry, bti_safe);
+        return 0;
     } else {
         printUsage();
+        return 2;
     }
 }

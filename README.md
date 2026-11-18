@@ -24,6 +24,20 @@ Instead of restarting processes or needing source code, `snap-oracle` parses PE3
 - **Deterministic `.data`/`.bss` Reset + Multi-Worker Scaling (`src/dll_snapshot.zig`, `src/pool.zig`, `src/worker.zig`)**:
   - Restores dirty writable target data pages after every run and minimization step, supports `--jobs N` multi-process corpus syncing, and provides framed `diff_protocol` stdio workers.
 
+## Enterprise ARM64 Compliance, Migration & DevSecOps Modules
+
+To support ISVs porting to Windows-on-ARM, Apple Silicon, Android 15+ (16K), and cloud Graviton/N1X fleets:
+
+- **SARIF 2.1.0, JSON, JUnit & GitHub Actions Reporting (`src/finding.zig`, `src/report.zig`)**: Unified finding model with FNV-1a deduplication fingerprints, SHA-256 artifact hashes, CWE tags, and `report convert`.
+- **Cross-OS Dependency & ARM64EC Mixed-Arch Chain Scanner (`src/imports.zig`)**: Walks PE Import/Delay/CHPE (`ARM64EC`/`ARM64X`), ELF `PT_DYNAMIC`/`DT_NEEDED`, and Mach-O `LC_LOAD_DYLIB`/Universal Fat chains (`deps`).
+- **4K / 16K / 64K Kernel Page-Size Readiness (`src/pagesize.zig`)**: Audits ELF `mmap` congruence, segment alignments, W^X page overlaps, and hardcoded `0x1000`/`0xFFF` constants (`pagesize --fix-hints`).
+- **AArch64 Hardening & Supply-Chain Compliance (`src/hardening.zig`)**: Scores PE `DllCharacteristics`/CFG + non-leaf PAC/BTI prologue coverage, ELF PIE/NX/RELRO/`TEXTREL`/MTE, and Mach-O PIE/`CS_RUNTIME` code signing (`harden`).
+- **CycloneDX 1.5 & SPDX 2.3 Binary SBOM & Provenance (`src/sbom.zig`)**: Fingerprints statically embedded native libraries (OpenSSL, zlib, SQLite, ONNX Runtime, llama.cpp, ggml, etc.) + RSDS/Rich Header/GNU build-id/LC_UUID (`sbom`).
+- **ARM64 Vectorization & Performance Migration Advisor (`src/perfadvisor.zig`)**: Flags unvectorized scalar FP loops, LL/SC vs LSE contention, missing DotProd (`SDOT`)/`I8MM`/`BF16` compute instructions, and x64 VEX/EVEX SIMD paths (`perf-advise`).
+- **x64 -> ARM64 Source & Binary Porting Scanner (`src/portscan.zig`)**: Comment- and literal-aware C/C++/Rust/Zig scanner catching `_mm_*` intrinsics, `__rdtsc`, x86 inline asm, asymmetric `#ifdef _M_X64`, `volatile` weak-memory sync hazards, and `char` signedness (`portscan`).
+- **Defensive Crash Triage, Corpus Distillation & Coverage Exports (`src/crash_triage.zig`, `src/cmin.zig`, `src/covreport.zig`, `src/harnessgen.zig`, `src/symbols.zig`)**: Classifies crashes (PAC/BTI, null-deref, stack overflow, input-tainted writes), distills minimal corpora (`cmin --tmin`), exports **DrCov v2** (IDA/Ghidra/Binary Ninja Lighthouse), **LCOV**, and **HTML** hit-maps (`cov`), generates **C / Zig / Rust / Python** harnesses & standalone reproducers (`gen`), and demangles Itanium/MSVC C++ symbols (`sym`).
+- **CI Gates, Baselines, Crash DB, Benchmarks & Offline Ed25519 Licensing (`src/ci_gate.zig`, `src/crashdb.zig`, `src/bench.zig`, `src/license.zig`)**: CRC32-guarded finding DB (`crashdb`), fingerprint baseline suppression (`baseline`), expiring policy waivers & GitHub/GitLab/AzDO/Jenkins workflow generators (`ci`), statistical MAD hardware benchmarks (`bench`), and offline Ed25519 commercial license verification (`license`).
+
 ## Build
 
 Requires Zig `0.17.1`:
@@ -72,6 +86,22 @@ mkdir corp
 
 # Differential execution across two binaries (or via `worker` over stdio/SSH)
 .\zig-out\bin\snap-oracle.exe diff --a build_a.dll --b build_b.dll --entry arm64_abi_probe --iters 10000
+
+# Enterprise ARM64 Compliance, Porting, Triage & CI/CD Workflows
+.\zig-out\bin\snap-oracle.exe harden .\zig-out\bin\test_target.dll --format sarif --out harden.sarif --fail-on high
+.\zig-out\bin\snap-oracle.exe pagesize .\zig-out\bin\test_target.dll --fix-hints
+.\zig-out\bin\snap-oracle.exe deps .\zig-out\bin\test_target.dll --recursive
+.\zig-out\bin\snap-oracle.exe sbom .\zig-out\bin\test_target.dll --format cyclonedx --out bom.cdx.json
+.\zig-out\bin\snap-oracle.exe perf-advise .\zig-out\bin\test_target.dll --profile snapdragon-x-elite
+.\zig-out\bin\snap-oracle.exe portscan .\src
+.\zig-out\bin\snap-oracle.exe triage --target .\zig-out\bin\test_target.dll --entry stateful_counter --input crash.bin
+.\zig-out\bin\snap-oracle.exe gen repro --target .\zig-out\bin\test_target.dll --entry stateful_counter --input crash.bin --lang c --out repro.c
+.\zig-out\bin\snap-oracle.exe cmin --target .\zig-out\bin\test_target.dll --entry gguf_header_parse --corpus corp_in --out corp_min --tmin
+.\zig-out\bin\snap-oracle.exe cov --target .\zig-out\bin\test_target.dll --corpus corp_min --format html --out coverage.html
+.\zig-out\bin\snap-oracle.exe cov --target .\zig-out\bin\test_target.dll --corpus corp_min --format drcov --out coverage.drcov
+.\zig-out\bin\snap-oracle.exe bench --suite all --json bench.json
+.\zig-out\bin\snap-oracle.exe ci init --provider github --out .github/workflows/snap-oracle-gate.yml
+.\zig-out\bin\snap-oracle.exe license status
 ```
 
 See [docs/ARM64_ARCHITECTURE_AND_LAPTOPS.md](docs/ARM64_ARCHITECTURE_AND_LAPTOPS.md) for the full ARM64 roadmap, use cases, and laptop hardware compatibility guide.

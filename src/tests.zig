@@ -23,6 +23,23 @@ const runner = @import("runner.zig");
 const worker = @import("worker.zig");
 const pool = @import("pool.zig");
 const test_target = @import("test_target.zig");
+const finding = @import("finding.zig");
+const report = @import("report.zig");
+const symbols = @import("symbols.zig");
+const license = @import("license.zig");
+const imports = @import("imports.zig");
+const pagesize = @import("pagesize.zig");
+const hardening = @import("hardening.zig");
+const sbom = @import("sbom.zig");
+const perfadvisor = @import("perfadvisor.zig");
+const portscan = @import("portscan.zig");
+const crash_triage = @import("crash_triage.zig");
+const harnessgen = @import("harnessgen.zig");
+const cmin = @import("cmin.zig");
+const covreport = @import("covreport.zig");
+const bench = @import("bench.zig");
+const crashdb = @import("crashdb.zig");
+const ci_gate = @import("ci_gate.zig");
 
 comptime {
     _ = arch;
@@ -47,6 +64,23 @@ comptime {
     _ = worker;
     _ = pool;
     _ = test_target;
+    _ = finding;
+    _ = report;
+    _ = symbols;
+    _ = license;
+    _ = imports;
+    _ = pagesize;
+    _ = hardening;
+    _ = sbom;
+    _ = perfadvisor;
+    _ = portscan;
+    _ = crash_triage;
+    _ = harnessgen;
+    _ = cmin;
+    _ = covreport;
+    _ = bench;
+    _ = crashdb;
+    _ = ci_gate;
 }
 
 test "arm64 basic-block decoder" {
@@ -231,4 +265,253 @@ test "end-to-end decodeArm64BasicBlocks + BreakpointTable + VEH one-shot coverag
     try std.testing.expect(!res2.crashed);
     try std.testing.expectEqual(@as(u64, 0), res2.ret_val);
     try std.testing.expectEqual(@as(usize, 3), table.hitCount());
+}
+
+test "arm64_isa compute extensions & 4K hardcoded constant detector" {
+    try std.testing.expectEqual(arm64_isa.ComputeExt.dotprod, arm64_isa.classifyComputeExt(0x4E80_9400)); // sdot
+    try std.testing.expectEqual(arm64_isa.ComputeExt.i8mm, arm64_isa.classifyComputeExt(0x4E80_A400)); // smmla
+    try std.testing.expectEqual(arm64_isa.ComputeExt.crypto_aes, arm64_isa.classifyComputeExt(0x4E28_4800)); // aese
+    try std.testing.expectEqual(arm64_isa.ComputeExt.crc32, arm64_isa.classifyComputeExt(0x1AC0_4000)); // crc32b
+    try std.testing.expect(arm64_isa.isHardcoded4kPageImm(0xD282_0000)); // mov x0, #0x1000
+    try std.testing.expect(arm64_isa.isHardcoded4kPageImm(0x9274_CC00)); // and x0, x0, #~0xfff
+    try std.testing.expect(!arm64_isa.isHardcoded4kPageImm(0xD503_201F)); // nop
+}
+
+test "finding + SARIF 2.1.0 / JUnit / JSON roundtrip" {
+    const alloc = std.testing.allocator;
+    var fs = finding.FindingSet.init(alloc);
+    defer fs.deinit();
+
+    try fs.add(.{
+        .rule_id = "SO-HARDEN-003",
+        .artifact = "C:/bins/demo_arm64.dll",
+        .rva = 0x1200,
+        .func_name = "parse_header",
+        .detail = "Control Flow Guard \"missing\" in <demo>",
+    });
+
+    const json_bytes = try report.renderFindingSet(alloc, &fs, .json, "PAYLOAD");
+    defer alloc.free(json_bytes);
+    try std.testing.expect(std.mem.indexOf(u8, json_bytes, "\"SO-HARDEN-003\"") != null);
+
+    var reparsed = finding.FindingSet.init(alloc);
+    defer reparsed.deinit();
+    try report.parseJsonReportIntoFindingSet(alloc, json_bytes, &reparsed);
+    try std.testing.expectEqual(@as(usize, 1), reparsed.items.items.len);
+    try std.testing.expectEqualStrings("SO-HARDEN-003", reparsed.items.items[0].rule_id);
+
+    const sarif = try report.renderFindingSet(alloc, &fs, .sarif, "PAYLOAD");
+    defer alloc.free(sarif);
+    try std.testing.expect(std.mem.indexOf(u8, sarif, "\"version\": \"2.1.0\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sarif, "\"security-severity\"") != null);
+
+    const junit = try report.renderFindingSet(alloc, &fs, .junit, null);
+    defer alloc.free(junit);
+    try std.testing.expect(std.mem.indexOf(u8, junit, "&lt;demo&gt;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, junit, "<failure ") != null);
+}
+
+test "symbols demangler (Itanium and MSVC)" {
+    const alloc = std.testing.allocator;
+    const it = try symbols.demangle(alloc, "_ZN4snap6Oracle4initEv");
+    defer alloc.free(it);
+    try std.testing.expect(std.mem.startsWith(u8, it, "snap::Oracle::init"));
+
+    const msvc = try symbols.demangle(alloc, "?parseHeader@Parser@snap@@QEAAXXZ");
+    defer alloc.free(msvc);
+    try std.testing.expect(std.mem.startsWith(u8, msvc, "snap::Parser::parseHeader"));
+}
+
+test "Ed25519 offline commercial license verification" {
+    const alloc = std.testing.allocator;
+    const seed: [32]u8 = @splat(0x5A);
+    const tok_json = try license.generateDemoSignedTokenJson(
+        std.testing.io,
+        alloc,
+        "ArmEnterpriseInc",
+        .enterprise_commercial,
+        50,
+        "2027-12-31",
+        seed,
+    );
+    defer alloc.free(tok_json);
+
+    const ok = try license.verifyTokenJson(alloc, tok_json, null, 20261119);
+    try std.testing.expect(ok.valid);
+    try std.testing.expectEqual(license.LicenseTier.enterprise_commercial, ok.tier);
+
+    const expired = try license.verifyTokenJson(alloc, tok_json, null, 20280101);
+    try std.testing.expect(!expired.valid);
+
+    const wrong_pk_buf: [64]u8 = @splat('0');
+    const wrong_pk = try license.verifyTokenJson(alloc, tok_json, &wrong_pk_buf, 20261119);
+    try std.testing.expect(!wrong_pk.valid);
+}
+
+test "imports compatibility matrix & synthetic SBOM embedded component detection" {
+    try std.testing.expectEqual(imports.CompatStatus.ok, imports.checkArchCompatibility(.arm64, false, .arm64, false));
+    try std.testing.expectEqual(imports.CompatStatus.machine_mismatch, imports.checkArchCompatibility(.arm64, false, .amd64, false));
+    try std.testing.expectEqual(imports.CompatStatus.ec_bridge_ok, imports.checkArchCompatibility(.arm64, true, .amd64, false));
+
+    // Minimal valid PE32+ ARM64 buffer embedding an OpenSSL string
+    const alloc = std.testing.allocator;
+    var raw: [1024]u8 = @splat(0);
+    raw[0] = 'M';
+    raw[1] = 'Z';
+    std.mem.writeInt(u32, raw[0x3C..][0..4], 0x80, .little);
+    @memcpy(raw[0x80..0x84], "PE\x00\x00");
+    std.mem.writeInt(u16, raw[0x84..][0..2], 0xAA64, .little);
+    std.mem.writeInt(u16, raw[0x86..][0..2], 1, .little);
+    std.mem.writeInt(u16, raw[0x94..][0..2], 240, .little);
+    std.mem.writeInt(u16, raw[0x98..][0..2], 0x020B, .little);
+    std.mem.writeInt(u32, raw[0xD0..][0..4], 0x1000, .little);
+    @memcpy(raw[0x300..0x30E], "OpenSSL 3.0.13");
+
+    var bom = try sbom.buildSbom(alloc, "demo_arm64.dll", &raw);
+    defer bom.deinit();
+    try std.testing.expect(bom.components.len >= 1);
+    try std.testing.expectEqualStrings("OpenSSL", bom.components[0].name);
+    try std.testing.expectEqualStrings("3.0.13", bom.components[0].version);
+
+    const cdx = try sbom.renderSbom(alloc, &bom, .cyclonedx);
+    defer alloc.free(cdx);
+    try std.testing.expect(std.mem.indexOf(u8, cdx, "pkg:generic/openssl@3.0.13") != null);
+}
+
+test "pagesize readiness catches 4K ELF failure on 16K kernels & portscan catches x64 hazards" {
+    const alloc = std.testing.allocator;
+    // Build minimal ELF64 AArch64 with 1 PT_LOAD (p_align = 4096 -> fail 16K!)
+    var elf: [256]u8 = @splat(0);
+    @memcpy(elf[0..4], "\x7fELF");
+    elf[4] = 2; // ELF64
+    elf[5] = 1; // LE
+    elf[6] = 1;
+    std.mem.writeInt(u16, elf[16..18], 3, .little); // ET_DYN
+    std.mem.writeInt(u16, elf[18..20], 183, .little); // EM_AARCH64
+    std.mem.writeInt(u64, elf[32..40], 64, .little); // e_phoff
+    std.mem.writeInt(u16, elf[54..56], 56, .little); // e_phentsize
+    std.mem.writeInt(u16, elf[56..58], 1, .little); // e_phnum
+    // PT_LOAD at offset 64: p_type=1, p_flags=5 (RX), p_offset=0, p_vaddr=0, memsz=256, align=4096
+    std.mem.writeInt(u32, elf[64..68], 1, .little);
+    std.mem.writeInt(u32, elf[68..72], 5, .little);
+    std.mem.writeInt(u64, elf[96..104], 256, .little);
+    std.mem.writeInt(u64, elf[104..112], 256, .little);
+    std.mem.writeInt(u64, elf[112..120], 4096, .little);
+
+    var fs = finding.FindingSet.init(alloc);
+    defer fs.deinit();
+    const ps_rep = try pagesize.auditPageSize(alloc, "libfoo.so", &elf, &fs);
+    try std.testing.expectEqual(pagesize.PageVerdict.pass, ps_rep.targets[0].verdict); // 4K pass
+    try std.testing.expectEqual(pagesize.PageVerdict.fail, ps_rep.targets[1].verdict); // 16K fail
+
+    // Source portscan ignores comments and flags real intrinsics
+    var src_fs = finding.FindingSet.init(alloc);
+    defer src_fs.deinit();
+    const sample_src =
+        \\// comment mentioning _mm_add_ps should be ignored
+        \\#ifdef _M_X64
+        \\uint64_t t = __rdtsc();
+        \\__m128i v = _mm_setzero_si128();
+        \\#endif
+        \\volatile int ready_flag = 0;
+        \\
+    ;
+    _ = try portscan.scanSourceText(alloc, "fast.c", sample_src, &src_fs);
+    try std.testing.expect(src_fs.items.items.len >= 3);
+}
+
+test "crash_triage classification, harnessgen, cmin set-cover, baseline diff & expiring waivers" {
+    const alloc = std.testing.allocator;
+
+    const pac_res = veh.RunResult{
+        .crashed = true,
+        .exception_code = 0xC000_0005,
+        .exception_addr = 0x1000,
+        .fault_rva = 0x200,
+        .fault_addr = 0x2000_0000_DEAD_BEEF,
+        .access_type = 1,
+        .ret_val = 0,
+    };
+    const v_pac = crash_triage.classifyCrash(pac_res, "ABCD", null, null, null);
+    try std.testing.expectEqual(crash_triage.CrashClass.pac_auth_fail, v_pac.class);
+
+    var write_in: [8]u8 = undefined;
+    std.mem.writeInt(u64, &write_in, 0x0000_0000_4142_4344, .little);
+    const taint_res = veh.RunResult{
+        .crashed = true,
+        .exception_code = 0xC000_0005,
+        .exception_addr = 0x1000,
+        .fault_rva = 0x204,
+        .fault_addr = 0x4142_4344,
+        .access_type = 2,
+        .ret_val = 0,
+    };
+    const v_write = crash_triage.classifyCrash(taint_res, &write_in, null, null, null);
+    try std.testing.expectEqual(crash_triage.CrashClass.wild_write, v_write.class);
+    try std.testing.expect(v_write.input_tainted_addr);
+
+    const c_rep = try harnessgen.generateRepro(alloc, .c, "target.dll", "fuzz_entry", "STAT");
+    defer alloc.free(c_rep);
+    try std.testing.expect(std.mem.indexOf(u8, c_rep, "CRASH_INPUT") != null);
+
+    // cmin greedy set-cover picks 2 seeds covering {0,1,2,3} skipping redundant seed #2
+    const traces = [_]cmin.SeedTrace{
+        .{ .name = "s0", .bytes = "AAAA", .crashed = false, .hit_blocks = &.{ 0, 1 } },
+        .{ .name = "s1", .bytes = "BBBBBBBB", .crashed = false, .hit_blocks = &.{ 2, 3 } },
+        .{ .name = "s2", .bytes = "CCCCCCCCCCCC", .crashed = false, .hit_blocks = &.{ 0, 2 } },
+    };
+    const picked = try cmin.selectMinimalSeeds(alloc, 4, &traces);
+    defer alloc.free(picked);
+    try std.testing.expectEqual(@as(usize, 2), picked.len);
+
+    // CI Gate baseline + expiring waiver
+    var fs = finding.FindingSet.init(alloc);
+    defer fs.deinit();
+    try fs.add(.{ .rule_id = "SO-HARDEN-003", .artifact = "app.dll", .detail = "missing CFG" });
+    const rep_json = try report.renderFindingSet(alloc, &fs, .json, null);
+    defer alloc.free(rep_json);
+
+    const waiver_active =
+        \\{ "waivers": [{ "rule_id": "SO-HARDEN-003", "artifact": "app.dll", "expires": "2027-01-01" }] }
+    ;
+    var active1 = finding.FindingSet.init(alloc);
+    defer active1.deinit();
+    const g1 = try ci_gate.evaluateGate(alloc, rep_json, null, waiver_active, .high, 20261119, &active1);
+    try std.testing.expect(g1.passed);
+    try std.testing.expectEqual(@as(usize, 1), g1.waived);
+
+    const waiver_expired =
+        \\{ "waivers": [{ "rule_id": "SO-HARDEN-003", "artifact": "app.dll", "expires": "2026-01-01" }] }
+    ;
+    var active2 = finding.FindingSet.init(alloc);
+    defer active2.deinit();
+    const g2 = try ci_gate.evaluateGate(alloc, rep_json, null, waiver_expired, .high, 20261119, &active2);
+    try std.testing.expect(!g2.passed);
+    try std.testing.expectEqual(@as(usize, 1), g2.expired_waivers);
+}
+
+test "hostile malformed binary input resilience across enterprise static parsers" {
+    const alloc = std.testing.allocator;
+    var rng = mutator.Rng.init(0xCAFE_BABE_1337_0001);
+    var buf: [512]u8 = @splat(0);
+    for (0..32) |_| {
+        buf[0] = 'M';
+        buf[1] = 'Z';
+        const len = mutator.mutateHavoc(&rng, &buf, 256);
+        const slice = buf[0..len];
+
+        if (imports.analyzeImports(alloc, slice)) |*ia| {
+            var tmp = ia.*;
+            tmp.deinit();
+        } else |_| {}
+
+        var fs = finding.FindingSet.init(alloc);
+        defer fs.deinit();
+        _ = pagesize.auditPageSize(alloc, "fuzz.bin", slice, &fs) catch {};
+        _ = hardening.auditHardening(alloc, "fuzz.bin", slice, .baseline, &fs) catch {};
+        if (sbom.buildSbom(alloc, "fuzz.bin", slice)) |*s| {
+            var tmp = s.*;
+            tmp.deinit();
+        } else |_| {}
+    }
 }

@@ -3,6 +3,9 @@ const binary = @import("binary.zig");
 const pe = @import("pe.zig");
 const cfg = @import("cfg.zig");
 const arm64_isa = @import("arm64_isa.zig");
+const finding = @import("finding.zig");
+const report_mod = @import("report.zig");
+const hardening = @import("hardening.zig");
 
 pub const FuzzCandidate = struct {
     name: []u8,
@@ -301,6 +304,54 @@ pub fn runAuditCommand(io: std.Io, allocator: std.mem.Allocator, path: []const u
             });
         }
     }
+}
+
+pub fn runAuditCommandEx(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !u8 {
+    if (args.len == 0) {
+        std.debug.print("Usage: snap-oracle audit <binary> [--format text|json|sarif|junit|gha] [--out <file>] [--fail-on <sev>]\n", .{});
+        return 2;
+    }
+
+    var bin_path: ?[]const u8 = null;
+    var fmt: report_mod.ReportFormat = .text;
+    var out_path: ?[]const u8 = null;
+    var fail_on: finding.Severity = .high;
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (std.mem.eql(u8, a, "--format") and i + 1 < args.len) {
+            i += 1;
+            fmt = report_mod.ReportFormat.fromString(args[i]) orelse .text;
+        } else if (std.mem.eql(u8, a, "--out") and i + 1 < args.len) {
+            i += 1;
+            out_path = args[i];
+        } else if (std.mem.eql(u8, a, "--fail-on") and i + 1 < args.len) {
+            i += 1;
+            fail_on = finding.Severity.fromString(args[i]) orelse .high;
+        } else if (bin_path == null and a.len > 0 and a[0] != '-') {
+            bin_path = a;
+        }
+    }
+
+    const path = bin_path orelse {
+        std.debug.print("Usage: snap-oracle audit <binary> [--format text|json|sarif|junit|gha] [--out <file>]\n", .{});
+        return 2;
+    };
+
+    if (fmt == .text and out_path == null) {
+        try runAuditCommand(io, allocator, path);
+        return 0;
+    }
+
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(256 * 1024 * 1024));
+    defer allocator.free(bytes);
+
+    var fs = finding.FindingSet.init(allocator);
+    defer fs.deinit();
+    _ = try hardening.auditHardening(allocator, path, bytes, .baseline, &fs);
+    try report_mod.emitOrPrint(io, allocator, &fs, fmt, out_path, bytes);
+    return fs.exitCode(fail_on);
 }
 
 test "audit analyzes ARM64 PE32+ image and flags BTI, PAC, LSE, CMP" {

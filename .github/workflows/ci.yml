@@ -38,7 +38,13 @@ jobs:
 
           zig build -Doptimize=ReleaseFast
           .\zig-out\bin\snap-oracle.exe hwinfo
-          .\zig-out\bin\snap-oracle.exe audit .\arm64_test_target.dll
+          .\zig-out\bin\snap-oracle.exe audit .\arm64_test_target.dll --format sarif --out arm64.sarif --fail-on critical
+          .\zig-out\bin\snap-oracle.exe harden .\arm64_test_target.dll --fail-on critical
+          .\zig-out\bin\snap-oracle.exe deps .\arm64_test_target.dll --fail-on critical
+          .\zig-out\bin\snap-oracle.exe pagesize .\arm64_test_target.dll --fail-on critical
+          .\zig-out\bin\snap-oracle.exe sbom .\arm64_test_target.dll --format cyclonedx --out arm64.cdx.json
+          .\zig-out\bin\snap-oracle.exe perf-advise .\arm64_test_target.dll --profile snapdragon-x-elite
+          .\zig-out\bin\snap-oracle.exe bench --suite decode
           .\zig-out\bin\snap-oracle.exe inspect .\arm64_test_target.dll
 
   win-arm64-native:

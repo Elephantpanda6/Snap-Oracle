@@ -33,6 +33,8 @@ threadlocal var g_active: bool = false;
 threadlocal var g_caught: bool = false;
 threadlocal var g_exc_code: u32 = 0;
 threadlocal var g_exc_addr: usize = 0;
+threadlocal var g_fault_addr: usize = 0;
+threadlocal var g_access_type: u8 = 0;
 threadlocal var g_bp_table: ?*coverage.BreakpointTable = null;
 threadlocal var g_mod_base: usize = 0;
 threadlocal var g_mod_size: usize = 0;
@@ -50,6 +52,8 @@ pub const RunResult = struct {
     exception_code: u32,
     exception_addr: usize,
     fault_rva: u32 = 0,
+    fault_addr: usize = 0,
+    access_type: u8 = 0, // 0=unknown, 1=read, 2=write, 8=exec
     ret_val: u64,
 };
 
@@ -116,6 +120,19 @@ fn vehHandler(ep: *EXCEPTION_POINTERS) callconv(.winapi) c_long {
             g_caught = true;
             g_exc_code = code;
             g_exc_addr = @intFromPtr(ep.ExceptionRecord.ExceptionAddress);
+            if ((code == 0xC000_0005 or code == 0xC000_0006) and ep.ExceptionRecord.NumberParameters >= 2) {
+                const raw_acc = ep.ExceptionRecord.ExceptionInformation[0];
+                g_access_type = switch (raw_acc) {
+                    0 => 1, // read
+                    1 => 2, // write
+                    8 => 8, // exec (DEP)
+                    else => 0,
+                };
+                g_fault_addr = ep.ExceptionRecord.ExceptionInformation[1];
+            } else {
+                g_access_type = 0;
+                g_fault_addr = 0;
+            }
             g_active = false;
             WinApi.RtlRestoreContext(&g_return_ctx, null);
         },
@@ -250,6 +267,20 @@ fn posixSignalHandler(sig: std.posix.SIG, _: *const std.posix.siginfo_t, ctx_ptr
     g_caught = true;
     g_exc_code = mapPosixSignalToWinCode(sig);
     g_exc_addr = @intCast(pc_val);
+    g_access_type = 0;
+    if (builtin.os.tag == .linux and builtin.cpu.arch == .aarch64) {
+        g_fault_addr = @intCast(uc.mcontext._fault_address);
+    } else if (builtin.os.tag.isDarwin() and builtin.cpu.arch == .aarch64) {
+        g_fault_addr = @intCast(uc.mcontext._far);
+        // ARM64 ESR_EL1 EC=0x24 (Data Abort from same EL): bit 6 is WnR (1=write, 0=read)
+        if (((uc.mcontext._esr >> 26) & 0x3F) == 0x24) {
+            g_access_type = if ((uc.mcontext._esr & 0x40) != 0) 2 else 1;
+        }
+    } else if (builtin.os.tag.isDarwin() and builtin.cpu.arch == .x86_64) {
+        g_fault_addr = @intCast(uc.mcontext._faultvaddr);
+    } else {
+        g_fault_addr = 0;
+    }
     g_active = false;
 
     if (builtin.cpu.arch == .aarch64) {
@@ -317,6 +348,8 @@ pub noinline fn runProtected(func: TargetFn, data: [*]const u8, len: usize) RunR
     g_caught = false;
     g_exc_code = 0;
     g_exc_addr = 0;
+    g_fault_addr = 0;
+    g_access_type = 0;
 
     if (builtin.os.tag == .windows) {
         WinApi.RtlCaptureContext(&g_return_ctx);
@@ -331,6 +364,8 @@ pub noinline fn runProtected(func: TargetFn, data: [*]const u8, len: usize) RunR
                 .exception_code = g_exc_code,
                 .exception_addr = clean_addr,
                 .fault_rva = arch.computeFaultRva(clean_addr, g_mod_base, g_mod_size),
+                .fault_addr = g_fault_addr,
+                .access_type = g_access_type,
                 .ret_val = 0,
             };
         }
@@ -420,6 +455,8 @@ pub noinline fn runProtected(func: TargetFn, data: [*]const u8, len: usize) RunR
                 .exception_code = g_exc_code,
                 .exception_addr = clean_addr,
                 .fault_rva = arch.computeFaultRva(clean_addr, g_mod_base, g_mod_size),
+                .fault_addr = g_fault_addr,
+                .access_type = g_access_type,
                 .ret_val = 0,
             };
         }
