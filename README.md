@@ -78,4 +78,8 @@ See [docs/ARM64_ARCHITECTURE_AND_LAPTOPS.md](docs/ARM64_ARCHITECTURE_AND_LAPTOPS
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+**Non-Commercial & Authorized-Use License (Paid Commercial License Required for Companies)** — see [LICENSE](LICENSE).
+
+- **Individuals & Non-Commercial Users**: Free for personal, educational, academic, and non-commercial research use on systems/binaries you own or have explicit permission to test.
+- **Companies & Commercial Use**: Strictly prohibited without a **paid Commercial License** from the copyright holder (`Elephantpanda6`).
+- **Author Protection & Disclaimer**: Provided "AS IS" strictly for lawful, authorized testing; the author (`Elephantpanda6`) bears no responsibility or liability for any activities performed by users, who assume sole legal responsibility and agree to indemnify the author.

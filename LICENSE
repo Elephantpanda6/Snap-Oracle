@@ -1,21 +1,104 @@
-MIT License
+Snap-Oracle Non-Commercial & Authorized-Use License
+(Incorporating PolyForm Noncommercial License 1.0.0 + Commercial Licensing & Author Protection Terms)
 
-Copyright (c) 2026 Elephantpanda6
+Copyright (c) 2026 Elephantpanda6 (https://github.com/Elephantpanda6/Snap-Oracle)
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+================================================================================
+1. FREE NON-COMMERCIAL & PERSONAL USE GRANT
+================================================================================
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+Subject to the terms and conditions of this License, the Licensor (Elephantpanda6)
+hereby grants you a non-exclusive, worldwide, royalty-free, non-transferable,
+revocable license to use, compile, execute, copy, modify, and redistribute this
+software solely for **Personal, Educational, Academic, and Non-Commercial Purposes**.
 
+Permitted Non-Commercial Uses include:
+- Personal research, learning, and individual security testing by an individual
+  on hardware, binaries, and systems owned by that individual or for which
+  explicit written authorization has been obtained.
+- Non-profit academic research, university coursework, and defensive open-source
+  security research with no direct or indirect commercial advantage.
+
+================================================================================
+2. PROHIBITION OF FREE COMMERCIAL USE (PAID COMMERCIAL LICENSE REQUIRED)
+================================================================================
+
+ANY USE OF THIS SOFTWARE BY, FOR, OR ON BEHALF OF A COMPANY, CORPORATION,
+FOR-PROFIT ORGANIZATION, OR COMMERCIAL ENTERPRISE IS STRICTLY PROHIBITED WITHOUT
+FIRST OBTAINING A SEPARATE, PAID COMMERCIAL LICENSE FROM THE LICENSOR.
+
+Without limiting the generality of the foregoing, you MAY NOT use this software
+under this free license for:
+- Internal business operations, corporate QA, corporate security auditing,
+  internal CI/CD pipelines, or product verification at any for-profit company
+  or commercial entity (regardless of company size or revenue).
+- Developing, testing, benchmarking, training, or supporting any commercial
+  product, SaaS, managed security service, or consulting engagement.
+- Any activity intended for or directed toward commercial advantage, business
+  operations, or monetary compensation.
+
+To obtain a paid Commercial License for corporate, enterprise, or commercial use,
+contact the copyright holder via https://github.com/Elephantpanda6/Snap-Oracle.
+
+================================================================================
+3. AUTHORIZED USE ONLY, AUTHOR NON-LIABILITY & INDEMNIFICATION SHIELD
+================================================================================
+
+A. AUTHORIZED SYSTEMS ONLY:
+This software is provided solely as a defensive software testing, binary
+auditing, and static/dynamic analysis engineering tool. All license rights under
+this agreement are strictly conditioned on your lawful use of the software
+ONLY against software, binaries, and systems that you own or have explicit,
+verifiable written permission from the owner to test. Any unauthorized, unlawful,
+or malicious use automatically terminates this License immediately without notice.
+
+B. NO AUTHOR RESPONSIBILITY FOR USER ACTIVITIES:
+The Licensor, Author, Copyright Holder, and associated GitHub account
+(Elephantpanda6) and any contributors have zero control over how third parties
+download, compile, configure, or execute this software, and do NOT endorse,
+authorize, facilitate, or assume responsibility for any testing, fuzzing,
+analysis, or other activities performed with this software by any user.
+ALL LEGAL, ETHICAL, AND OPERATIONAL RESPONSIBILITY FOR ANY USE OR OUTPUT OF THIS
+SOFTWARE RESTS SOLELY AND EXCLUSIVELY WITH THE USER EXECUTING IT.
+
+C. INDEMNIFICATION AND HOLD HARMLESS:
+To the maximum extent permitted by applicable law, by downloading, building,
+distributing, or using this software, you agree to indemnify, defend, and hold
+harmless the Licensor/Author (Elephantpanda6), associated GitHub account owners,
+and contributors from and against any and all claims, demands, suits, actions,
+liabilities, fines, penalties, damages, losses, costs, and expenses (including
+reasonable attorneys' fees) arising out of or relating to: (i) your use, misuse,
+or execution of this software; (ii) your breach of this License or violation of
+any applicable law or third-party rights; or (iii) any data loss, system crash,
+service disruption, or security incident caused by your actions.
+
+D. DISCLAIMER OF WARRANTIES AND LIMITATION OF LIABILITY:
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+FITNESS FOR A PARTICULAR PURPOSE, TITLE, AND NON-INFRINGEMENT. IN NO EVENT SHALL
+THE AUTHORS, COPYRIGHT HOLDERS, OR ASSOCIATED GITHUB ACCOUNT (ELEPHANTPANDA6) BE
+LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, CONSEQUENTIAL,
+OR PUNITIVE DAMAGES (INCLUDING LOSS OF DATA, BUSINESS INTERRUPTION, HARDWARE
+FAILURE, OR THIRD-PARTY CLAIMS) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
+WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR
+OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED
+OF THE POSSIBILITY OF SUCH DAMAGE.
+
+================================================================================
+4. INCORPORATION OF POLYFORM NONCOMMERCIAL LICENSE 1.0.0 TERMS
+================================================================================
+
+To the extent consistent with Sections 1 through 3 above, the operative terms of
+the PolyForm Noncommercial License 1.0.0 (https://polyformproject.org/licenses/noncommercial/1.0.0)
+also apply:
+- Required Notices: You must retain this full LICENSE file and all copyright
+  notices in every copy, binary redistribution, or derivative work.
+- No Trademark Rights: This License does not grant permission to use the trade
+  names, trademarks, or service marks of the Licensor.
+- Patent Grant (Non-Commercial Only): Licensor grants a non-commercial patent
+  license for claims necessarily infringed by the software as distributed by the
+  Licensor, limited strictly to permitted non-commercial uses, which terminates
+  if you initiate patent litigation alleging the software infringes a patent.
+- Failure to Comply: Any breach of the non-commercial scope, paid commercial
+  licensing requirement, or authorized-use conditions immediately terminates all
+  rights granted under this License.
