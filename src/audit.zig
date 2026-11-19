@@ -1,5 +1,6 @@
 const std = @import("std");
 const binary = @import("binary.zig");
+const macho = @import("macho_arm64.zig");
 const pe = @import("pe.zig");
 const cfg = @import("cfg.zig");
 const arm64_isa = @import("arm64_isa.zig");
@@ -62,7 +63,8 @@ pub const AuditReport = struct {
 
 /// Analyze any PE32+, ELF64, or 64-bit Mach-O binary for ARM64 instruction features,
 /// PAC/BTI hardening, exclusive monitor hazards, ARM laptop ISA compatibility, and fuzzable exports.
-pub fn analyzeArm64Binary(allocator: std.mem.Allocator, bytes: []const u8) !AuditReport {
+pub fn analyzeArm64Binary(allocator: std.mem.Allocator, raw_bytes: []const u8) !AuditReport {
+    const bytes = macho.unwrapFatSlice(raw_bytes);
     var img = try binary.parseBinary(allocator, bytes);
     defer img.deinit();
 

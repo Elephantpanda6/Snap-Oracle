@@ -1,5 +1,6 @@
 const std = @import("std");
 const pe = @import("pe.zig");
+const macho = @import("macho_arm64.zig");
 const arm64_isa = @import("arm64_isa.zig");
 const binary = @import("binary.zig");
 
@@ -501,9 +502,10 @@ pub fn decodeX64BasicBlocksFull(
 /// for every recovered function (`.pdata`, `.symtab`/`.dynsym`, or `LC_FUNCTION_STARTS`).
 pub fn decodeAllTextBasicBlocksEx(
     allocator: std.mem.Allocator,
-    bytes: []const u8,
+    raw_bytes: []const u8,
     bti_safe: bool,
 ) ![]BasicBlock {
+    const bytes = macho.unwrapFatSlice(raw_bytes);
     var img = try binary.parseBinary(allocator, bytes);
     defer img.deinit();
 

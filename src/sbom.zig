@@ -1,5 +1,6 @@
 const std = @import("std");
 const binary = @import("binary.zig");
+const macho = @import("macho_arm64.zig");
 const pe = @import("pe.zig");
 const imports = @import("imports.zig");
 const finding = @import("finding.zig");
@@ -150,11 +151,20 @@ pub fn buildSbom(allocator: std.mem.Allocator, path: []const u8, bytes: []const 
     defer imp_analysis.deinit();
     for (imp_analysis.modules) |mod| {
         const clean_base = finding.basename(mod.name);
-        if (seen_keys.contains(clean_base)) continue;
+        if (clean_base.len == 0) continue;
+        var stack_lower: [256]u8 = undefined;
+        const lower_probe = if (clean_base.len <= stack_lower.len) blk: {
+            for (clean_base, 0..) |c, idx| stack_lower[idx] = std.ascii.toLower(c);
+            break :blk stack_lower[0..clean_base.len];
+        } else blk: {
+            const tmp = try aa.alloc(u8, clean_base.len);
+            for (clean_base, 0..) |c, idx| tmp[idx] = std.ascii.toLower(c);
+            break :blk tmp;
+        };
+        if (seen_keys.contains(lower_probe)) continue;
+        const lower = if (clean_base.len <= stack_lower.len) try aa.dupe(u8, lower_probe) else lower_probe;
         const name_dup = try aa.dupe(u8, clean_base);
-        const lower = try aa.alloc(u8, clean_base.len);
-        for (clean_base, 0..) |c, i| lower[i] = std.ascii.toLower(c);
-        try seen_keys.put(name_dup, {});
+        try seen_keys.put(lower, {});
         try comp_list.append(aa, .{
             .name = name_dup,
             .purl_name = lower,
@@ -171,10 +181,11 @@ pub fn buildSbom(allocator: std.mem.Allocator, path: []const u8, bytes: []const 
         }
     }.lessThan);
 
+    const artifact_name = try aa.dupe(u8, finding.basename(path));
     return .{
         .allocator = allocator,
         .arena = arena,
-        .artifact_name = try aa.dupe(u8, finding.basename(path)),
+        .artifact_name = artifact_name,
         .sha256_hex = finding.sha256Hex(bytes),
         .format = img.format,
         .machine = img.machine,
@@ -227,19 +238,22 @@ fn extractPeProvenance(aa: std.mem.Allocator, bytes: []const u8, img: *const bin
                         const dbg_type = std.mem.readInt(u32, bytes[ent + 12 ..][0..4], .little);
                         const ptr_raw = std.mem.readInt(u32, bytes[ent + 24 ..][0..4], .little);
                         const sz_data = std.mem.readInt(u32, bytes[ent + 16 ..][0..4], .little);
-                        if (dbg_type == 2 and sz_data >= 25 and @as(u64, ptr_raw) + sz_data <= bytes.len) {
-                            const cv = bytes[ptr_raw .. ptr_raw + sz_data];
+                        const cv_end = std.math.add(u64, ptr_raw, sz_data) catch continue;
+                        if (dbg_type == 2 and sz_data >= 25 and cv_end <= bytes.len) {
+                            const cv = bytes[@as(usize, ptr_raw)..@as(usize, @intCast(cv_end))];
                             if (std.mem.eql(u8, cv[0..4], "RSDS")) {
                                 const tail = cv[24..];
                                 const z = std.mem.indexOfScalar(u8, tail, 0) orelse tail.len;
                                 prov.pdb_path = try aa.dupe(u8, tail[0..z]);
-                                const hex = "0123456789abcdef";
-                                var guid_hex: [32]u8 = undefined;
-                                for (cv[4..20], 0..) |b, gi| {
-                                    guid_hex[gi * 2] = hex[b >> 4];
-                                    guid_hex[gi * 2 + 1] = hex[b & 0xF];
-                                }
-                                prov.build_id = try aa.dupe(u8, &guid_hex);
+                                const d1 = std.mem.readInt(u32, cv[4..8], .little);
+                                const d2 = std.mem.readInt(u16, cv[8..10], .little);
+                                const d3 = std.mem.readInt(u16, cv[10..12], .little);
+                                const d4 = cv[12..20];
+                                prov.build_id = try std.fmt.allocPrint(
+                                    aa,
+                                    "{x:0>8}{x:0>4}{x:0>4}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}",
+                                    .{ d1, d2, d3, d4[0], d4[1], d4[2], d4[3], d4[4], d4[5], d4[6], d4[7] },
+                                );
                                 break;
                             }
                         }
@@ -252,14 +266,17 @@ fn extractPeProvenance(aa: std.mem.Allocator, bytes: []const u8, img: *const bin
 
 fn extractElfProvenance(aa: std.mem.Allocator, bytes: []const u8, img: *const binary.BinaryImage, prov: *Provenance) !void {
     if (img.findSection(".note.gnu.build-id")) |sec| {
-        if (@as(u64, sec.raw_offset) + sec.raw_size <= bytes.len and sec.raw_size >= 16) {
-            const note = bytes[sec.raw_offset .. sec.raw_offset + sec.raw_size];
+        const note_end = std.math.add(u64, sec.raw_offset, sec.raw_size) catch 0;
+        if (note_end > 0 and note_end <= bytes.len and sec.raw_size >= 16) {
+            const note = bytes[@as(usize, sec.raw_offset)..@as(usize, @intCast(note_end))];
             const namesz = std.mem.readInt(u32, note[0..4], .little);
             const descsz = std.mem.readInt(u32, note[4..8], .little);
             const ntype = std.mem.readInt(u32, note[8..12], .little);
-            const desc_off = 12 + ((namesz + 3) & ~@as(u32, 3));
-            if (ntype == 3 and @as(u64, desc_off) + descsz <= note.len and descsz <= 64) {
-                const raw_id = note[desc_off .. desc_off + descsz];
+            const name_aligned = (@as(u64, namesz) + 3) & ~@as(u64, 3);
+            const desc_off = 12 + name_aligned;
+            const desc_end = desc_off + @as(u64, descsz);
+            if (ntype == 3 and desc_end <= note.len and descsz <= 64) {
+                const raw_id = note[@as(usize, @intCast(desc_off))..@as(usize, @intCast(desc_end))];
                 const hex = "0123456789abcdef";
                 const out = try aa.alloc(u8, raw_id.len * 2);
                 for (raw_id, 0..) |b, idx| {
@@ -271,15 +288,17 @@ fn extractElfProvenance(aa: std.mem.Allocator, bytes: []const u8, img: *const bi
         }
     }
     if (img.findSection(".comment")) |sec| {
-        if (@as(u64, sec.raw_offset) + sec.raw_size <= bytes.len and sec.raw_size > 0) {
-            const raw_c = bytes[sec.raw_offset .. sec.raw_offset + sec.raw_size];
+        const c_end = std.math.add(u64, sec.raw_offset, sec.raw_size) catch 0;
+        if (c_end > 0 and c_end <= bytes.len and sec.raw_size > 0) {
+            const raw_c = bytes[@as(usize, sec.raw_offset)..@as(usize, @intCast(c_end))];
             const z = std.mem.indexOfScalar(u8, raw_c, 0) orelse @min(raw_c.len, 160);
             if (z > 0) prov.compiler_comment = try aa.dupe(u8, raw_c[0..@min(z, 160)]);
         }
     }
 }
 
-fn extractMachoProvenance(aa: std.mem.Allocator, bytes: []const u8, prov: *Provenance) !void {
+fn extractMachoProvenance(aa: std.mem.Allocator, raw_bytes: []const u8, prov: *Provenance) !void {
+    const bytes = macho.unwrapFatSlice(raw_bytes);
     if (bytes.len < 32 or std.mem.readInt(u32, bytes[0..4], .little) != 0xFEED_FACF) return;
     const ncmds = @min(std.mem.readInt(u32, bytes[16..20], .little), 4096);
     var off: usize = 32;
@@ -288,7 +307,7 @@ fn extractMachoProvenance(aa: std.mem.Allocator, bytes: []const u8, prov: *Prove
         if (off + 8 > bytes.len) break;
         const cmd = std.mem.readInt(u32, bytes[off..][0..4], .little);
         const cmdsize = std.mem.readInt(u32, bytes[off + 4 ..][0..4], .little);
-        if (cmdsize < 8 or off + cmdsize > bytes.len) break;
+        if (cmdsize < 8 or cmdsize > bytes.len - off) break;
         if (cmd == 0x1B and cmdsize >= 24) { // LC_UUID
             const hex = "0123456789abcdef";
             const out = try aa.alloc(u8, 32);
@@ -421,9 +440,13 @@ fn renderSpdx(allocator: std.mem.Allocator, sbom: *const SbomReport) ![]u8 {
     defer allocator.free(ns);
     try out.appendSlice(allocator, ",\n  \"documentNamespace\": ");
     try finding.appendJsonEscaped(&out, allocator, ns);
-    try out.appendSlice(allocator, ",\n  \"packages\": [\n    {\n      \"SPDXID\": \"SPDXRef-Package-Root\",\n      \"name\": ");
+    try out.appendSlice(allocator, ",\n  \"creationInfo\": {\n    \"created\": \"2026-01-01T00:00:00Z\",\n    \"creators\": [");
+    const creator = try std.fmt.allocPrint(allocator, "Tool: {s}-{s}", .{ finding.TOOL_NAME, finding.TOOL_VERSION });
+    defer allocator.free(creator);
+    try finding.appendJsonEscaped(&out, allocator, creator);
+    try out.appendSlice(allocator, "]\n  },\n  \"packages\": [\n    {\n      \"SPDXID\": \"SPDXRef-Package-Root\",\n      \"name\": ");
     try finding.appendJsonEscaped(&out, allocator, sbom.artifact_name);
-    try out.appendSlice(allocator, ",\n      \"downloadLocation\": \"NOASSERTION\",\n      \"checksums\": [{ \"algorithm\": \"SHA256\", \"checksumValue\": ");
+    try out.appendSlice(allocator, ",\n      \"downloadLocation\": \"NOASSERTION\",\n      \"filesAnalyzed\": false,\n      \"checksums\": [{ \"algorithm\": \"SHA256\", \"checksumValue\": ");
     try finding.appendJsonEscaped(&out, allocator, &sbom.sha256_hex);
     try out.appendSlice(allocator, " }]\n    }");
 
@@ -436,7 +459,13 @@ fn renderSpdx(allocator: std.mem.Allocator, sbom: *const SbomReport) ![]u8 {
         try finding.appendJsonEscaped(&out, allocator, c.name);
         try out.appendSlice(allocator, ",\n      \"versionInfo\": ");
         try finding.appendJsonEscaped(&out, allocator, c.version);
-        try out.appendSlice(allocator, ",\n      \"downloadLocation\": \"NOASSERTION\"\n    }");
+        try out.appendSlice(allocator, ",\n      \"downloadLocation\": \"NOASSERTION\",\n      \"filesAnalyzed\": false\n    }");
+    }
+    try out.appendSlice(allocator, "\n  ],\n  \"relationships\": [\n    {\n      \"spdxElementId\": \"SPDXRef-DOCUMENT\",\n      \"relationshipType\": \"DESCRIBES\",\n      \"relatedSpdxElement\": \"SPDXRef-Package-Root\"\n    }");
+    for (sbom.components, 0..) |_, i| {
+        const rel = try std.fmt.allocPrint(allocator, ",\n    {{\n      \"spdxElementId\": \"SPDXRef-Package-Root\",\n      \"relationshipType\": \"DEPENDS_ON\",\n      \"relatedSpdxElement\": \"SPDXRef-Comp-{d}\"\n    }}", .{i});
+        defer allocator.free(rel);
+        try out.appendSlice(allocator, rel);
     }
     try out.appendSlice(allocator, "\n  ]\n}\n");
     return out.toOwnedSlice(allocator);

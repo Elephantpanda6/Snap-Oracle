@@ -276,8 +276,8 @@ pub fn decode(insn: u32) DecodedArm64 {
         };
     }
 
-    // ADD/SUB immediate (non-zr)
-    if ((insn & 0x1F00_0000) == 0x1100_0000) {
+    // ADD/SUB immediate (non-zr; bit 23=0 excludes MTE ADDG/SUBG)
+    if ((insn & 0x1F80_0000) == 0x1100_0000) {
         const sh: u6 = if (((insn >> 22) & 1) != 0) 12 else 0;
         const imm12: u64 = (insn >> 10) & 0xFFF;
         return .{
@@ -404,7 +404,7 @@ pub fn classifyComputeExt(insn: u32) ComputeExt {
         return .crypto_aes;
     }
     // SHA-1 / SHA-256 / SHA-512
-    if ((insn & 0xFF20_8C00) == 0x5E00_0000 or (insn & 0xFFFF_CC00) == 0x5E28_0800 or (insn & 0xFFE0_FC00) == 0xCE60_8000) {
+    if (((insn & 0xFFE0_8C00) == 0x5E00_0000 and ((insn >> 12) & 7) <= 6) or (insn & 0xFFFF_CC00) == 0x5E28_0800 or (insn & 0xFFE0_FC00) == 0xCE60_8000) {
         return .crypto_sha;
     }
     // CRC32 / CRC32C
@@ -419,14 +419,18 @@ pub fn classifyComputeExt(insn: u32) ComputeExt {
 }
 
 /// Detect likely hardcoded 4KB (0x1000 / 0xFFF) page-size constants or page-offset bitmasks
-/// in AArch64 instructions (MOVZ/MOVK, ADD/SUB/CMP imm12, AND/TST logical immediate).
+/// in AArch64 instructions (MOVZ hw=0, ADD/SUB/CMP imm12, AND/ORR/EOR/TST logical immediate).
 pub fn isHardcoded4kPageImm(insn: u32) bool {
     const d = decode(insn);
-    if (d.class == .mov_wide and (d.imm == 0x1000 or d.imm == 0xFFF)) {
-        return true;
+    if (d.class == .mov_wide) {
+        const opc = (insn >> 29) & 0x3;
+        const hw = (insn >> 21) & 0x3;
+        if (opc == 2 and hw == 0 and (d.imm == 0x1000 or d.imm == 0xFFF)) {
+            return true;
+        }
     }
-    // ADD / ADDS / SUB / SUBS (including CMP/CMN alias) immediate: op 100010 sh imm12
-    if ((insn & 0x1F00_0000) == 0x1100_0000) {
+    // ADD / ADDS / SUB / SUBS (including CMP/CMN alias) immediate: bits [28:23] == 100010 (excludes MTE ADDG/SUBG)
+    if ((insn & 0x1F80_0000) == 0x1100_0000) {
         const sh = (insn >> 22) & 1;
         const imm12 = (insn >> 10) & 0xFFF;
         if (sh == 0 and imm12 == 0xFFF) return true;
@@ -434,13 +438,16 @@ pub fn isHardcoded4kPageImm(insn: u32) bool {
     }
     // Logical immediate (AND/ORR/EOR/ANDS/TST): bits [28:23] == 100100
     if ((insn & 0x1F80_0000) == 0x1200_0000) {
+        const sf = (insn >> 31) & 1;
         const n = (insn >> 22) & 1;
         const immr = (insn >> 16) & 0x3F;
         const imms = (insn >> 10) & 0x3F;
-        // 64-bit #0xFFF (N=1, immr=0, imms=11) or #~0xFFF (N=1, immr=52, imms=51)
-        if (n == 1 and ((immr == 0 and imms == 11) or (immr == 52 and imms == 51))) return true;
-        // 32-bit #0xFFF (N=0, immr=0, imms=11) or #0xFFFFF000 (N=0, immr=20, imms=19)
-        if (n == 0 and ((immr == 0 and imms == 11) or (immr == 20 and imms == 19))) return true;
+        if (sf == n) {
+            // 64-bit #0xFFF (sf=1, N=1, immr=0, imms=11) or #~0xFFF (sf=1, N=1, immr=52, imms=51)
+            if (n == 1 and ((immr == 0 and imms == 11) or (immr == 52 and imms == 51))) return true;
+            // 32-bit #0xFFF (sf=0, N=0, immr=0, imms=11) or #0xFFFFF000 (sf=0, N=0, immr=20, imms=19)
+            if (n == 0 and ((immr == 0 and imms == 11) or (immr == 20 and imms == 19))) return true;
+        }
     }
     return false;
 }

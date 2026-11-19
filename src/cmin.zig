@@ -45,6 +45,11 @@ pub fn selectMinimalSeeds(
     defer allocator.free(used);
     @memset(used, false);
 
+    const seen_tag = try allocator.alloc(usize, num_blocks);
+    defer allocator.free(seen_tag);
+    @memset(seen_tag, 0);
+    var tag_gen: usize = 0;
+
     while (true) {
         var best_idx: ?usize = null;
         var best_gain: usize = 0;
@@ -52,9 +57,17 @@ pub fn selectMinimalSeeds(
 
         for (traces, 0..) |tr, idx| {
             if (used[idx] or tr.crashed) continue;
+            if (tag_gen == std.math.maxInt(usize)) {
+                @memset(seen_tag, 0);
+                tag_gen = 0;
+            }
+            tag_gen += 1;
             var gain: usize = 0;
             for (tr.hit_blocks) |b| {
-                if (b < num_blocks and !covered[b]) gain += 1;
+                if (b < num_blocks and !covered[b] and seen_tag[b] != tag_gen) {
+                    seen_tag[b] = tag_gen;
+                    gain += 1;
+                }
             }
             if (gain == 0) continue;
 
@@ -101,8 +114,9 @@ fn measureSeedTrace(
     }
 
     veh.setBreakpointTable(&bp_table);
-    @memcpy(arena.live_ptr[0..data.len], data);
-    const res = veh.runProtected(entry, arena.live_ptr, data.len);
+    const run_len = @min(data.len, arena.size);
+    if (run_len > 0) @memcpy(arena.live_ptr[0..run_len], data[0..run_len]);
+    const res = veh.runProtected(entry, arena.live_ptr, run_len);
     _ = arena.restoreDirtyPages() catch 0;
     _ = mod_snap.restore();
 
@@ -155,6 +169,7 @@ fn ddminSeed(
                 continue;
             }
             const cand = try allocator.alloc(u8, new_len);
+            errdefer allocator.free(cand);
             @memcpy(cand[0..offset], cur[0..offset]);
             @memcpy(cand[offset..new_len], cur[end..cur.len]);
 
@@ -261,19 +276,35 @@ pub fn runCminCommand(io: std.Io, allocator: std.mem.Allocator, args: []const []
     while (it.next(io) catch null) |ent| {
         if (ent.kind != .file) continue;
         const data = dir.readFileAlloc(io, ent.name, allocator, .limited(64 * 1024)) catch continue;
+        var data_owned = true;
+        errdefer if (data_owned) allocator.free(data);
+
         stats.seeds_in += 1;
         stats.bytes_in += data.len;
         const measured = try measureSeedTrace(allocator, target.entry, target.base_addr, img.machine, blocks, &arena, &mod_snap, data);
+        var hits_owned = true;
+        errdefer if (hits_owned) allocator.free(measured.hit_blocks);
         if (measured.crashed) stats.crashes_skipped += 1;
 
-        try names.append(allocator, try allocator.dupe(u8, ent.name));
-        try payloads.append(allocator, data);
-        try traces.append(allocator, .{
-            .name = names.items[names.items.len - 1],
+        const name_dup = try allocator.dupe(u8, ent.name);
+        var name_owned = true;
+        errdefer if (name_owned) allocator.free(name_dup);
+
+        try names.ensureUnusedCapacity(allocator, 1);
+        try payloads.ensureUnusedCapacity(allocator, 1);
+        try traces.ensureUnusedCapacity(allocator, 1);
+
+        names.appendAssumeCapacity(name_dup);
+        name_owned = false;
+        payloads.appendAssumeCapacity(data);
+        data_owned = false;
+        traces.appendAssumeCapacity(.{
+            .name = name_dup,
             .bytes = data,
             .crashed = measured.crashed,
             .hit_blocks = measured.hit_blocks,
         });
+        hits_owned = false;
     }
 
     const picked = try selectMinimalSeeds(allocator, blocks.len, traces.items);

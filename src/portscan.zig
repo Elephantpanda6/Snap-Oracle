@@ -1,5 +1,6 @@
 const std = @import("std");
 const binary = @import("binary.zig");
+const macho = @import("macho_arm64.zig");
 const cfg = @import("cfg.zig");
 const arm64_isa = @import("arm64_isa.zig");
 const finding = @import("finding.zig");
@@ -38,19 +39,47 @@ fn isBinaryMagic(bytes: []const u8) bool {
     return false;
 }
 
-fn stripLineComment(line: []const u8, is_zig_file: bool, in_block_comment: *bool, scratch: *[2048]u8) []const u8 {
+fn isCharLiteralEnd(line: []const u8, quote_pos: usize) ?usize {
+    const j = quote_pos + 1;
+    if (j >= line.len) return null;
+    if (line[j] == '\\') {
+        var k = j + 1;
+        if (k >= line.len) return null;
+        k += 1;
+        while (k < line.len and k < j + 12) : (k += 1) {
+            if (line[k] == '\\') {
+                k += 1;
+                continue;
+            }
+            if (line[k] == '\'') return k;
+            if (line[k] == ';' or line[k] == ',' or line[k] == ')' or line[k] == ' ') break;
+        }
+        return null;
+    }
+    if (line[j] == '\'') return null;
+    if (line[j] < 0x80) {
+        if (j + 1 < line.len and line[j + 1] == '\'') return j + 1;
+        return null;
+    }
+    if (std.unicode.utf8ByteSequenceLength(line[j])) |seq_len| {
+        if (j + seq_len < line.len and line[j + seq_len] == '\'') {
+            if (std.unicode.utf8Decode(line[j .. j + seq_len])) |_| {
+                return j + seq_len;
+            } else |_| {}
+        }
+    } else |_| {}
+    return null;
+}
+
+fn stripCommentsOnly(line: []const u8, is_zig_file: bool, in_block_comment: *bool, scratch: *[2048]u8) []const u8 {
     const raw_trimmed = std.mem.trim(u8, line, " \t\r");
     if (is_zig_file and std.mem.startsWith(u8, raw_trimmed, "\\\\")) {
         return "";
     }
-    const keep_strings = std.mem.startsWith(u8, raw_trimmed, "#include") or
-        std.mem.indexOf(u8, raw_trimmed, "__asm") != null or
-        std.mem.indexOf(u8, raw_trimmed, "asm volatile") != null;
 
     var out_len: usize = 0;
     var i: usize = 0;
     var in_str = false;
-    var str_quote: u8 = '"';
 
     while (i < line.len and out_len < scratch.len) {
         if (in_block_comment.*) {
@@ -77,37 +106,98 @@ fn stripLineComment(line: []const u8, is_zig_file: bool, in_block_comment: *bool
                 out_len += 1;
                 continue;
             }
-            if (c == '"' or c == '\'') {
+            if (c == '\'') {
+                if (isCharLiteralEnd(line, i)) |end_idx| {
+                    const span = @min(end_idx + 1 - i, scratch.len - out_len);
+                    @memcpy(scratch[out_len .. out_len + span], line[i .. i + span]);
+                    out_len += span;
+                    i = end_idx + 1;
+                    continue;
+                }
+            }
+            if (c == '"') {
                 in_str = true;
-                str_quote = c;
-                scratch[out_len] = c;
-                out_len += 1;
-                i += 1;
-                continue;
             }
             scratch[out_len] = c;
             out_len += 1;
             i += 1;
         } else {
             if (c == '\\' and i + 1 < line.len) {
-                if (keep_strings) {
-                    scratch[out_len] = c;
-                    out_len += 1;
-                }
+                const copy_n = @min(@as(usize, 2), scratch.len - out_len);
+                @memcpy(scratch[out_len .. out_len + copy_n], line[i .. i + copy_n]);
+                out_len += copy_n;
                 i += 2;
                 continue;
             }
-            if (c == str_quote) {
+            if (c == '"') {
                 in_str = false;
-                scratch[out_len] = c;
+            }
+            scratch[out_len] = c;
+            out_len += 1;
+            i += 1;
+        }
+    }
+    return scratch[0..out_len];
+}
+
+fn blankStrings(no_comments: []const u8, scratch: *[2048]u8) []const u8 {
+    var out_len: usize = 0;
+    var i: usize = 0;
+    var in_str = false;
+
+    while (i < no_comments.len and out_len < scratch.len) {
+        const c = no_comments[i];
+        if (!in_str) {
+            if (c == '\'') {
+                if (isCharLiteralEnd(no_comments, i)) |end_idx| {
+                    scratch[out_len] = '\'';
+                    out_len += 1;
+                    var k = i + 1;
+                    while (k < end_idx and out_len < scratch.len) : (k += 1) {
+                        scratch[out_len] = ' ';
+                        out_len += 1;
+                    }
+                    if (out_len < scratch.len) {
+                        scratch[out_len] = '\'';
+                        out_len += 1;
+                    }
+                    i = end_idx + 1;
+                    continue;
+                }
+            }
+            if (c == '"') {
+                in_str = true;
+            }
+            scratch[out_len] = c;
+            out_len += 1;
+            i += 1;
+        } else {
+            if (c == '\\' and i + 1 < no_comments.len) {
+                i += 2;
+                continue;
+            }
+            if (c == '"') {
+                in_str = false;
+                scratch[out_len] = '"';
             } else {
-                scratch[out_len] = if (keep_strings) c else ' ';
+                scratch[out_len] = ' ';
             }
             out_len += 1;
             i += 1;
         }
     }
     return scratch[0..out_len];
+}
+
+fn stripLineComment(line: []const u8, is_zig_file: bool, in_block_comment: *bool, scratch_c: *[2048]u8, scratch_s: *[2048]u8) []const u8 {
+    const no_comments = stripCommentsOnly(line, is_zig_file, in_block_comment, scratch_c);
+    if (no_comments.len == 0) return "";
+    const code_only = blankStrings(no_comments, scratch_s);
+    const code_trimmed = std.mem.trim(u8, code_only, " \t\r");
+    const keep_strings = std.mem.startsWith(u8, code_trimmed, "#include") or
+        std.mem.indexOf(u8, code_trimmed, "__asm") != null or
+        std.mem.indexOf(u8, code_trimmed, "asm volatile") != null;
+    return if (keep_strings) no_comments else code_only;
 }
 
 pub fn scanSourceText(
@@ -117,28 +207,49 @@ pub fn scanSourceText(
     out_fs: *finding.FindingSet,
 ) !usize {
     const is_zig = file_path.len > 4 and finding.eqlIgnoreCase(file_path[file_path.len - 4 ..], ".zig");
-    const file_mentions_arm64 = std.mem.indexOf(u8, source, "__aarch64__") != null or
-        std.mem.indexOf(u8, source, "_M_ARM64") != null or
-        std.mem.indexOf(u8, source, "aarch64") != null;
-    const file_has_atomics = std.mem.indexOf(u8, source, "std::atomic") != null or
-        std.mem.indexOf(u8, source, "__atomic_") != null or
-        std.mem.indexOf(u8, source, "atomic_load") != null or
-        std.mem.indexOf(u8, source, "MemoryBarrier") != null or
-        std.mem.indexOf(u8, source, "dmb ") != null;
+
+    var scratch_c: [2048]u8 = undefined;
+    var scratch_s: [2048]u8 = undefined;
+    var file_mentions_arm64 = false;
+    var file_has_atomics = false;
+    {
+        var pre_in_block = false;
+        var pre_lines = std.mem.splitScalar(u8, source, '\n');
+        while (pre_lines.next()) |raw_line| {
+            const nc = stripCommentsOnly(raw_line, is_zig, &pre_in_block, &scratch_c);
+            if (nc.len == 0) continue;
+            if (!file_mentions_arm64 and
+                (std.mem.indexOf(u8, nc, "__aarch64__") != null or
+                std.mem.indexOf(u8, nc, "_M_ARM64") != null or
+                std.mem.indexOf(u8, nc, "aarch64") != null))
+            {
+                file_mentions_arm64 = true;
+            }
+            if (!file_has_atomics and
+                (std.mem.indexOf(u8, nc, "std::atomic") != null or
+                std.mem.indexOf(u8, nc, "__atomic_") != null or
+                std.mem.indexOf(u8, nc, "atomic_load") != null or
+                std.mem.indexOf(u8, nc, "MemoryBarrier") != null or
+                std.mem.indexOf(u8, nc, "dmb ") != null))
+            {
+                file_has_atomics = true;
+            }
+            if (file_mentions_arm64 and file_has_atomics) break;
+        }
+    }
 
     var in_block_comment = false;
-    var scratch: [2048]u8 = undefined;
     var lines = std.mem.splitScalar(u8, source, '\n');
     var line_no: usize = 0;
 
-    // Limit repetitive hits per rule inside one file to keep enterprise reports actionable
+    // Limit repetitive hits per rule inside one file to keep reports actionable
     var simd_hits: usize = 0;
     var x86_guard_emitted = false;
     var volatile_emitted = false;
 
     while (lines.next()) |raw_line| {
         line_no += 1;
-        const clean = stripLineComment(raw_line, is_zig, &in_block_comment, &scratch);
+        const clean = stripLineComment(raw_line, is_zig, &in_block_comment, &scratch_c, &scratch_s);
         const trimmed = std.mem.trim(u8, clean, " \t\r");
         if (trimmed.len == 0) continue;
 
@@ -162,7 +273,7 @@ pub fn scanSourceText(
             try out_fs.add(.{
                 .rule_id = "SO-PORT-001",
                 .artifact = file_path,
-                .file_offset = @intCast(line_no),
+                .line = @intCast(line_no),
                 .detail = detail,
             });
         }
@@ -183,7 +294,7 @@ pub fn scanSourceText(
             try out_fs.add(.{
                 .rule_id = "SO-PORT-002",
                 .artifact = file_path,
-                .file_offset = @intCast(line_no),
+                .line = @intCast(line_no),
                 .detail = detail,
             });
         }
@@ -209,7 +320,7 @@ pub fn scanSourceText(
             try out_fs.add(.{
                 .rule_id = "SO-PORT-003",
                 .artifact = file_path,
-                .file_offset = @intCast(line_no),
+                .line = @intCast(line_no),
                 .detail = detail,
             });
         }
@@ -232,7 +343,7 @@ pub fn scanSourceText(
             try out_fs.add(.{
                 .rule_id = "SO-PORT-004",
                 .artifact = file_path,
-                .file_offset = @intCast(line_no),
+                .line = @intCast(line_no),
                 .detail = detail,
             });
         }
@@ -256,7 +367,7 @@ pub fn scanSourceText(
                 .rule_id = "SO-PORT-005",
                 .confidence = .medium,
                 .artifact = file_path,
-                .file_offset = @intCast(line_no),
+                .line = @intCast(line_no),
                 .detail = detail,
             });
         }
@@ -264,6 +375,7 @@ pub fn scanSourceText(
         // 6. Plain char signedness hazard
         if (std.mem.indexOf(u8, trimmed, "char ") != null and
             std.mem.indexOf(u8, trimmed, "signed char") == null and
+            std.mem.indexOf(u8, trimmed, "unsigned char") == null and
             (std.mem.indexOf(u8, trimmed, "< 0") != null or std.mem.indexOf(u8, trimmed, "== -1") != null))
         {
             const detail = try std.fmt.allocPrint(allocator, "{s}:{d}: plain 'char' compared against negative value (< 0 or == -1); unsigned on Linux AArch64", .{
@@ -275,7 +387,7 @@ pub fn scanSourceText(
                 .rule_id = "SO-PORT-006",
                 .confidence = .medium,
                 .artifact = file_path,
-                .file_offset = @intCast(line_no),
+                .line = @intCast(line_no),
                 .detail = detail,
             });
         }
@@ -291,7 +403,7 @@ pub fn scanSourceText(
                 .rule_id = "SO-PORT-007",
                 .confidence = .low,
                 .artifact = file_path,
-                .file_offset = @intCast(line_no),
+                .line = @intCast(line_no),
                 .detail = detail,
             });
         }
@@ -303,15 +415,17 @@ pub fn scanSourceText(
 pub fn scanBinaryPortability(
     allocator: std.mem.Allocator,
     path: []const u8,
-    bytes: []const u8,
+    raw_bytes: []const u8,
     out_fs: *finding.FindingSet,
 ) !void {
+    const bytes = macho.unwrapFatSlice(raw_bytes);
     var img = try binary.parseBinary(allocator, bytes);
     defer img.deinit();
 
     const text = img.findCodeSection() orelse return;
-    if (@as(u64, text.raw_offset) + text.raw_size > bytes.len or text.raw_size == 0) return;
-    const code = bytes[text.raw_offset .. text.raw_offset + text.raw_size];
+    const sec_end = std.math.add(u64, text.raw_offset, text.raw_size) catch return;
+    if (sec_end > bytes.len or text.raw_size == 0) return;
+    const code = bytes[@as(usize, text.raw_offset)..@as(usize, @intCast(sec_end))];
 
     if (img.isArm64()) {
         var ll_sc: usize = 0;

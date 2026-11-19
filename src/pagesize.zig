@@ -1,5 +1,6 @@
 const std = @import("std");
 const binary = @import("binary.zig");
+const macho = @import("macho_arm64.zig");
 const pe = @import("pe.zig");
 const arm64_isa = @import("arm64_isa.zig");
 const finding = @import("finding.zig");
@@ -48,19 +49,59 @@ pub const PageSizeReport = struct {
     targets: [3]TargetResult,
 };
 
+pub const TargetMask = struct {
+    k4: bool = false,
+    k16: bool = true,
+    k64: bool = false,
+
+    pub fn matches(self: TargetMask, p_u32: u32) bool {
+        return switch (p_u32) {
+            4096 => self.k4,
+            16384 => self.k16,
+            65536 => self.k64,
+            else => false,
+        };
+    }
+
+    pub fn parse(s: []const u8) ?TargetMask {
+        var m = TargetMask{ .k4 = false, .k16 = false, .k64 = false };
+        var any = false;
+        var it = std.mem.tokenizeAny(u8, s, ",; ");
+        while (it.next()) |tok| {
+            if (finding.eqlIgnoreCase(tok, "4k") or std.mem.eql(u8, tok, "4096")) {
+                m.k4 = true;
+                any = true;
+            } else if (finding.eqlIgnoreCase(tok, "16k") or std.mem.eql(u8, tok, "16384")) {
+                m.k16 = true;
+                any = true;
+            } else if (finding.eqlIgnoreCase(tok, "64k") or std.mem.eql(u8, tok, "65536")) {
+                m.k64 = true;
+                any = true;
+            } else if (finding.eqlIgnoreCase(tok, "all")) {
+                return .{ .k4 = true, .k16 = true, .k64 = true };
+            } else {
+                return null;
+            }
+        }
+        return if (any) m else null;
+    }
+};
+
 fn alignDown(val: u64, p: u64) u64 {
     return val & ~(p - 1);
 }
 
 fn alignUp(val: u64, p: u64) u64 {
-    return (val +| (p - 1)) & ~(p - 1);
+    if (val > std.math.maxInt(u64) - (p - 1)) return std.math.maxInt(u64);
+    return (val + (p - 1)) & ~(p - 1);
 }
 
 fn extractSegments(
     allocator: std.mem.Allocator,
-    bytes: []const u8,
+    raw_bytes: []const u8,
     img: *const binary.BinaryImage,
 ) !struct { segs: []SegmentInfo, pe_sec_align: u32, pe_file_align: u32 } {
+    const bytes = macho.unwrapFatSlice(raw_bytes);
     var list = std.ArrayList(SegmentInfo).empty;
     errdefer list.deinit(allocator);
     var pe_sec_align: u32 = 4096;
@@ -74,8 +115,9 @@ fn extractSegments(
                 const e_phnum = @min(std.mem.readInt(u16, bytes[56..58], .little), 256);
                 var i: u16 = 0;
                 while (i < e_phnum) : (i += 1) {
-                    const off = e_phoff + @as(u64, i) * e_phentsize;
-                    if (off + 56 > bytes.len or e_phentsize < 56) break;
+                    const off = std.math.add(u64, e_phoff, @as(u64, i) * e_phentsize) catch break;
+                    const off_end = std.math.add(u64, off, 56) catch break;
+                    if (off_end > bytes.len or e_phentsize < 56) break;
                     const ph = bytes[@intCast(off)..];
                     const p_type = std.mem.readInt(u32, ph[0..4], .little);
                     if (p_type != 1) continue; // PT_LOAD
@@ -107,7 +149,7 @@ fn extractSegments(
                     if (off + 8 > bytes.len) break;
                     const cmd = std.mem.readInt(u32, bytes[off..][0..4], .little);
                     const cmdsize = std.mem.readInt(u32, bytes[off + 4 ..][0..4], .little);
-                    if (cmdsize < 8 or off + cmdsize > bytes.len) break;
+                    if (cmdsize < 8 or cmdsize > bytes.len - off) break;
                     if (cmd == 0x19 and cmdsize >= 72) { // LC_SEGMENT_64
                         const segname_raw = bytes[off + 8 .. off + 24];
                         const z = std.mem.indexOfScalar(u8, segname_raw, 0) orelse 16;
@@ -118,7 +160,12 @@ fn extractSegments(
                         const initprot = std.mem.readInt(u32, bytes[off + 60 ..][0..4], .little);
                         // Skip __PAGEZERO guard segment
                         if (!(initprot == 0 and fileoff == 0 and vmaddr == 0)) {
-                            const eff_align: u64 = if ((vmaddr % 16384) == 0 and (fileoff % 16384) == 0) 16384 else 4096;
+                            const eff_align: u64 = if ((vmaddr % 65536) == 0 and (fileoff % 65536) == 0)
+                                65536
+                            else if ((vmaddr % 16384) == 0 and (fileoff % 16384) == 0)
+                                16384
+                            else
+                                4096;
                             try list.append(allocator, .{
                                 .name = segname_raw[0..z],
                                 .vaddr = vmaddr,
@@ -176,6 +223,17 @@ pub fn auditPageSize(
     bytes: []const u8,
     out_fs: *finding.FindingSet,
 ) !PageSizeReport {
+    return auditPageSizeEx(allocator, artifact_path, bytes, .{}, out_fs);
+}
+
+pub fn auditPageSizeEx(
+    allocator: std.mem.Allocator,
+    artifact_path: []const u8,
+    raw_bytes: []const u8,
+    target_mask: TargetMask,
+    out_fs: *finding.FindingSet,
+) !PageSizeReport {
+    const bytes = macho.unwrapFatSlice(raw_bytes);
     var img = try binary.parseBinary(allocator, bytes);
     defer img.deinit();
 
@@ -188,8 +246,9 @@ pub fn auditPageSize(
     if (img.isArm64()) {
         for (img.sections) |sec| {
             if ((sec.characteristics & pe.IMAGE_SCN_MEM_EXECUTE) == 0) continue;
-            if (@as(u64, sec.raw_offset) + sec.raw_size > bytes.len) continue;
-            const code = bytes[sec.raw_offset .. sec.raw_offset + sec.raw_size];
+            const sec_end = std.math.add(u64, sec.raw_offset, sec.raw_size) catch continue;
+            if (sec_end > bytes.len) continue;
+            const code = bytes[@as(usize, sec.raw_offset)..@as(usize, @intCast(sec_end))];
             var off: usize = 0;
             while (off + 4 <= code.len) : (off += 4) {
                 const insn = std.mem.readInt(u32, code[off..][0..4], .little);
@@ -223,6 +282,7 @@ pub fn auditPageSize(
 
     for (targets_p, 0..) |p_u32, tidx| {
         const p: u64 = p_u32;
+        const emit_findings = target_mask.matches(p_u32);
         var align_fails: usize = 0;
         var cong_fails: usize = 0;
         var wx_overlaps: usize = 0;
@@ -230,11 +290,12 @@ pub fn auditPageSize(
         for (seg_info.segs, 0..) |seg, sidx| {
             if (seg.p_align < p) {
                 align_fails += 1;
-                if (p_u32 == 16384) {
-                    const detail = try std.fmt.allocPrint(allocator, "{s} segment #{d} alignment {d} < {d} bytes (unsafe for 16K kernels: Apple Silicon / Android 15+)", .{
+                if (emit_findings) {
+                    const detail = try std.fmt.allocPrint(allocator, "{s} segment #{d} alignment {d} < {d} bytes (unsafe for {d}B kernel pages)", .{
                         finding.basename(artifact_path),
                         sidx,
                         seg.p_align,
+                        p_u32,
                         p_u32,
                     });
                     defer allocator.free(detail);
@@ -251,7 +312,7 @@ pub fn auditPageSize(
             if (img.format != .pe32plus and seg.memsz > 0) {
                 if ((seg.vaddr % p) != (seg.offset % p)) {
                     cong_fails += 1;
-                    if (p_u32 == 16384) {
+                    if (emit_findings) {
                         const detail = try std.fmt.allocPrint(allocator, "{s} segment {s} violates (vaddr 0x{x} % {d}) == (offset 0x{x} % {d})", .{
                             finding.basename(artifact_path),
                             seg.name,
@@ -273,12 +334,12 @@ pub fn auditPageSize(
 
             if (sidx + 1 < seg_info.segs.len) {
                 const next = seg_info.segs[sidx + 1];
-                if ((seg.executable and next.writable) or (seg.writable and next.executable)) {
+                if (seg.memsz > 0 and next.memsz > 0 and ((seg.executable and next.writable) or (seg.writable and next.executable))) {
                     const prev_end = alignUp(seg.vaddr +| seg.memsz, p);
                     const next_start = alignDown(next.vaddr, p);
                     if (next_start < prev_end) {
                         wx_overlaps += 1;
-                        if (p_u32 == 16384) {
+                        if (emit_findings) {
                             const detail = try std.fmt.allocPrint(allocator, "W/X segments {s} and {s} share a {d}-byte virtual page boundary", .{
                                 seg.name,
                                 next.name,
@@ -326,12 +387,13 @@ pub fn auditPageSize(
 
 pub fn runPagesizeCommand(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !u8 {
     if (args.len == 0) {
-        std.debug.print("Usage: snap-oracle pagesize <binary> [--fix-hints] [--format text|json|sarif|junit|gha] [--out <file>] [--fail-on <sev>]\n", .{});
+        std.debug.print("Usage: snap-oracle pagesize <binary> [--targets 4k,16k,64k] [--fix-hints] [--format text|json|sarif|junit|gha] [--out <file>] [--fail-on <sev>]\n", .{});
         return 2;
     }
 
     var bin_path: ?[]const u8 = null;
     var fix_hints = false;
+    var target_mask = TargetMask{};
     var fmt: report.ReportFormat = .text;
     var out_path: ?[]const u8 = null;
     var fail_on: finding.Severity = .high;
@@ -341,6 +403,12 @@ pub fn runPagesizeCommand(io: std.Io, allocator: std.mem.Allocator, args: []cons
         const a = args[i];
         if (std.mem.eql(u8, a, "--fix-hints")) {
             fix_hints = true;
+        } else if (std.mem.eql(u8, a, "--targets") and i + 1 < args.len) {
+            i += 1;
+            target_mask = TargetMask.parse(args[i]) orelse {
+                std.debug.print("[pagesize] invalid --targets value '{s}' (expected comma-separated 4k,16k,64k)\n", .{args[i]});
+                return 2;
+            };
         } else if (std.mem.eql(u8, a, "--format") and i + 1 < args.len) {
             i += 1;
             fmt = report.ReportFormat.fromString(args[i]) orelse .text;
@@ -356,7 +424,7 @@ pub fn runPagesizeCommand(io: std.Io, allocator: std.mem.Allocator, args: []cons
     }
 
     const path = bin_path orelse {
-        std.debug.print("Usage: snap-oracle pagesize <binary> [--fix-hints]\n", .{});
+        std.debug.print("Usage: snap-oracle pagesize <binary> [--targets 4k,16k,64k] [--fix-hints]\n", .{});
         return 2;
     };
 
@@ -366,7 +434,7 @@ pub fn runPagesizeCommand(io: std.Io, allocator: std.mem.Allocator, args: []cons
     var fs = finding.FindingSet.init(allocator);
     defer fs.deinit();
 
-    const res = try auditPageSize(allocator, path, bytes, &fs);
+    const res = try auditPageSizeEx(allocator, path, bytes, target_mask, &fs);
 
     if (fmt == .text) {
         std.debug.print(

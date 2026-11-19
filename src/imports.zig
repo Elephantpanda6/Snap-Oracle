@@ -106,34 +106,45 @@ pub fn analyzeImports(allocator: std.mem.Allocator, bytes: []const u8) !ImportAn
     errdefer arena.deinit();
     const aa = arena.allocator();
 
-    // Handle Universal Mach-O Fat container upfront
+    // Handle Universal Mach-O Fat container upfront (32-bit 0xCAFEBABE and 64-bit 0xCAFEBABF)
     var fat_list = std.ArrayList(MachoFatSlice).empty;
     var active_bytes = bytes;
     if (bytes.len >= 8) {
         const be_magic = std.mem.readInt(u32, bytes[0..4], .big);
-        if (be_magic == 0xCAFE_BABE) {
+        if (be_magic == 0xCAFE_BABE or be_magic == 0xCAFE_BABF) {
+            const is_64 = (be_magic == 0xCAFE_BABF);
+            const entry_sz: usize = if (is_64) 32 else 20;
             const nfat = std.mem.readInt(u32, bytes[4..8], .big);
             const count = @min(nfat, 16);
             var arm64_slice: ?[]const u8 = null;
             var first_slice: ?[]const u8 = null;
             var i: u32 = 0;
             while (i < count) : (i += 1) {
-                const off = 8 + @as(usize, i) * 20;
-                if (off + 20 > bytes.len) break;
+                const off = 8 + @as(usize, i) * entry_sz;
+                if (off + entry_sz > bytes.len) break;
                 const cputype = std.mem.readInt(u32, bytes[off..][0..4], .big);
                 const cpusubtype = std.mem.readInt(u32, bytes[off + 4 ..][0..4], .big);
-                const slice_off = std.mem.readInt(u32, bytes[off + 8 ..][0..4], .big);
-                const slice_sz = std.mem.readInt(u32, bytes[off + 12 ..][0..4], .big);
+                const slice_off: u64 = if (is_64)
+                    std.mem.readInt(u64, bytes[off + 8 ..][0..8], .big)
+                else
+                    std.mem.readInt(u32, bytes[off + 8 ..][0..4], .big);
+                const slice_sz: u64 = if (is_64)
+                    std.mem.readInt(u64, bytes[off + 16 ..][0..8], .big)
+                else
+                    std.mem.readInt(u32, bytes[off + 12 ..][0..4], .big);
                 try fat_list.append(aa, .{
                     .cputype = cputype,
                     .cpusubtype = cpusubtype,
-                    .offset = slice_off,
-                    .size = slice_sz,
+                    .offset = @intCast(@min(slice_off, std.math.maxInt(u32))),
+                    .size = @intCast(@min(slice_sz, std.math.maxInt(u32))),
                 });
-                if (@as(u64, slice_off) + @as(u64, slice_sz) <= bytes.len) {
-                    const sub = bytes[slice_off .. slice_off + slice_sz];
-                    if (first_slice == null) first_slice = sub;
-                    if (cputype == 0x0100_000C) arm64_slice = sub;
+                if (slice_off >= 8 and slice_sz > 0) {
+                    const slice_end = std.math.add(u64, slice_off, slice_sz) catch continue;
+                    if (slice_end <= bytes.len) {
+                        const sub = bytes[@intCast(slice_off)..@intCast(slice_end)];
+                        if (first_slice == null) first_slice = sub;
+                        if (cputype == 0x0100_000C and arm64_slice == null) arm64_slice = sub;
+                    }
                 }
             }
             if (arm64_slice orelse first_slice) |sel| {
@@ -163,6 +174,10 @@ pub fn analyzeImports(allocator: std.mem.Allocator, bytes: []const u8) !ImportAn
         },
     }
 
+    const rpaths_owned = try rpath_list.toOwnedSlice(aa);
+    const mods_owned = try mod_list.toOwnedSlice(aa);
+    const fat_owned = try fat_list.toOwnedSlice(aa);
+
     return .{
         .allocator = allocator,
         .arena = arena,
@@ -172,9 +187,9 @@ pub fn analyzeImports(allocator: std.mem.Allocator, bytes: []const u8) !ImportAn
         .is_arm64x_hybrid = is_hybrid or (img.is_arm64ec and has_chpe),
         .has_chpe_metadata = has_chpe,
         .soname = soname,
-        .rpaths = try rpath_list.toOwnedSlice(aa),
-        .modules = try mod_list.toOwnedSlice(aa),
-        .fat_slices = try fat_list.toOwnedSlice(aa),
+        .rpaths = rpaths_owned,
+        .modules = mods_owned,
+        .fat_slices = fat_owned,
     };
 }
 
@@ -335,13 +350,15 @@ fn parseElfDynamics(
     const count = @min(e_phnum, 256);
     var i: u16 = 0;
     while (i < count) : (i += 1) {
-        const ph_off = e_phoff + @as(u64, i) * e_phentsize;
-        if (ph_off + 56 > bytes.len) break;
+        const ph_off = std.math.add(u64, e_phoff, @as(u64, i) * e_phentsize) catch break;
+        const ph_end = std.math.add(u64, ph_off, 56) catch break;
+        if (ph_end > bytes.len) break;
         const p_type = std.mem.readInt(u32, bytes[@as(usize, @intCast(ph_off))..][0..4], .little);
         if (p_type == 2) { // PT_DYNAMIC
             const p_offset = std.mem.readInt(u64, bytes[@as(usize, @intCast(ph_off + 8))..][0..8], .little);
             const p_filesz = std.mem.readInt(u64, bytes[@as(usize, @intCast(ph_off + 32))..][0..8], .little);
-            if (p_offset + p_filesz <= bytes.len) {
+            const p_end = std.math.add(u64, p_offset, p_filesz) catch break;
+            if (p_end <= bytes.len) {
                 dyn_off = @intCast(p_offset);
                 dyn_sz = @intCast(p_filesz);
             }
@@ -353,8 +370,9 @@ fn parseElfDynamics(
     // Resolve DT_STRTAB string table either via matching .dynstr section or DT_STRTAB vaddr
     var strtab: []const u8 = &.{};
     if (img.findSection(".dynstr")) |ds| {
-        if (@as(u64, ds.raw_offset) + ds.raw_size <= bytes.len) {
-            strtab = bytes[ds.raw_offset .. ds.raw_offset + ds.raw_size];
+        const ds_end = std.math.add(u64, ds.raw_offset, ds.raw_size) catch 0;
+        if (ds.raw_size > 0 and ds_end <= bytes.len) {
+            strtab = bytes[@as(usize, ds.raw_offset)..@as(usize, @intCast(ds_end))];
         }
     }
 
@@ -372,10 +390,15 @@ fn parseElfDynamics(
     }
 
     if (strtab.len == 0 and strtab_vaddr != 0) {
-        const rel: u32 = @truncate(strtab_vaddr -| img.image_base);
-        if (img.rvaToOffset(rel)) |so| {
-            const end = @min(bytes.len, so + @as(usize, @intCast(@min(strsz, bytes.len - so))));
-            strtab = bytes[so..end];
+        const rel_u64 = strtab_vaddr -| img.image_base;
+        if (rel_u64 <= std.math.maxInt(u32)) {
+            const rel: u32 = @intCast(rel_u64);
+            if (img.rvaToOffset(rel)) |so| {
+                if (so < bytes.len) {
+                    const end = @min(bytes.len, so + @as(usize, @intCast(@min(strsz, bytes.len - so))));
+                    strtab = bytes[so..end];
+                }
+            }
         }
     }
     if (strtab.len == 0) return;
@@ -422,7 +445,7 @@ fn parseMachoDylibs(
         if (off + 8 > bytes.len) break;
         const cmd = std.mem.readInt(u32, bytes[off..][0..4], .little);
         const cmdsize = std.mem.readInt(u32, bytes[off + 4 ..][0..4], .little);
-        if (cmdsize < 8 or off + cmdsize > bytes.len) break;
+        if (cmdsize < 8 or cmdsize > bytes.len - off) break;
 
         switch (cmd) {
             0x0C, 0x8000_0018, 0x8000_001F, 0x20 => { // LC_LOAD_*_DYLIB / LC_REEXPORT_DYLIB
@@ -491,6 +514,13 @@ pub fn checkArchCompatibility(
     return .machine_mismatch;
 }
 
+fn lowerBase(aa: std.mem.Allocator, name: []const u8) ![]u8 {
+    const base = finding.basename(name);
+    const out = try aa.alloc(u8, base.len);
+    for (base, 0..) |c, i| out[i] = std.ascii.toLower(c);
+    return out;
+}
+
 pub fn auditDependencies(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -500,15 +530,28 @@ pub fn auditDependencies(
     recursive: bool,
     out_fs: *finding.FindingSet,
 ) !ImportAnalysis {
-    const analysis = try analyzeImports(allocator, bytes);
+    var analysis = try analyzeImports(allocator, bytes);
+    errdefer analysis.deinit();
+
     const parent_dir = std.Io.Dir.path.dirname(path) orelse ".";
+    const root_base = finding.basename(path);
+
+    var bfs_arena = std.heap.ArenaAllocator.init(allocator);
+    defer bfs_arena.deinit();
+    const baa = bfs_arena.allocator();
 
     var visited = std.StringHashMap(void).init(allocator);
     defer visited.deinit();
-    try visited.put(finding.basename(path), {});
+    try visited.put(try lowerBase(baa, path), {});
 
-    var work_queue = std.ArrayList([]const u8).empty;
-    defer work_queue.deinit(allocator);
+    const QueueItem = struct {
+        parent_name: []const u8,
+        mod_name: []const u8,
+        parent_machine: pe.Machine,
+        parent_ec: bool,
+        is_direct: bool,
+    };
+    var queue = std.ArrayList(QueueItem).empty;
 
     for (analysis.modules) |mod| {
         // Check ordinal-only PE imports
@@ -518,7 +561,7 @@ pub fn auditDependencies(
         }
         if (ordinal_cnt > 0) {
             const detail = try std.fmt.allocPrint(allocator, "{s} imports {d} ordinal-only function(s) from {s}", .{
-                finding.basename(path),
+                root_base,
                 ordinal_cnt,
                 mod.name,
             });
@@ -532,20 +575,42 @@ pub fn auditDependencies(
         }
 
         if (mod.is_system) continue;
+        if (recursive and visited.count() >= 64) continue;
 
-        // Locate candidate binary alongside parent or inside search_root
-        const child_bytes = tryResolveDepFile(io, allocator, mod.name, parent_dir, search_root) catch |err| switch (err) {
+        const key = try lowerBase(baa, mod.name);
+        if (visited.contains(key)) continue;
+        try visited.put(key, {});
+        try queue.append(baa, .{
+            .parent_name = root_base,
+            .mod_name = try baa.dupe(u8, mod.name),
+            .parent_machine = analysis.machine,
+            .parent_ec = analysis.is_arm64ec,
+            .is_direct = true,
+        });
+    }
+
+    var q_idx: usize = 0;
+    while (q_idx < queue.items.len) : (q_idx += 1) {
+        const item = queue.items[q_idx];
+
+        const child_bytes = tryResolveDepFile(io, allocator, item.mod_name, parent_dir, search_root) catch |err| switch (err) {
             error.FileNotFound => {
-                const detail = try std.fmt.allocPrint(allocator, "Non-system dependency '{s}' imported by '{s}' not found in parent dir or --root", .{
-                    mod.name,
-                    finding.basename(path),
-                });
+                const detail = if (item.is_direct)
+                    try std.fmt.allocPrint(allocator, "Non-system dependency '{s}' imported by '{s}' not found in parent dir or --root", .{
+                        item.mod_name,
+                        item.parent_name,
+                    })
+                else
+                    try std.fmt.allocPrint(allocator, "Transitive non-system dependency '{s}' imported by '{s}' not found in parent dir or --root", .{
+                        item.mod_name,
+                        item.parent_name,
+                    });
                 defer allocator.free(detail);
                 try out_fs.add(.{
                     .rule_id = "SO-DEP-003",
                     .artifact = path,
                     .detail = detail,
-                    .func_name = mod.name,
+                    .func_name = item.mod_name,
                 });
                 continue;
             },
@@ -553,72 +618,103 @@ pub fn auditDependencies(
         };
         defer allocator.free(child_bytes);
 
-        var child_img = binary.parseBinary(allocator, child_bytes) catch continue;
-        defer child_img.deinit();
+        if (!recursive) {
+            var child_img = binary.parseBinary(allocator, child_bytes) catch continue;
+            defer child_img.deinit();
 
-        const compat = checkArchCompatibility(analysis.machine, analysis.is_arm64ec, child_img.machine, child_img.is_arm64ec);
+            const compat = checkArchCompatibility(item.parent_machine, item.parent_ec, child_img.machine, child_img.is_arm64ec);
+            switch (compat) {
+                .machine_mismatch => {
+                    const detail = try std.fmt.allocPrint(allocator, "{s} ({s}) cannot load incompatible {s} ({s})", .{
+                        item.parent_name,
+                        @tagName(item.parent_machine),
+                        item.mod_name,
+                        @tagName(child_img.machine),
+                    });
+                    defer allocator.free(detail);
+                    try out_fs.add(.{
+                        .rule_id = "SO-DEP-001",
+                        .artifact = path,
+                        .detail = detail,
+                        .func_name = item.mod_name,
+                    });
+                },
+                .ec_mixed_warn => {
+                    const detail = try std.fmt.allocPrint(allocator, "ARM64EC / native ARM64 transition between {s} and {s}; verify ARM64X pure forwarders", .{
+                        item.parent_name,
+                        item.mod_name,
+                    });
+                    defer allocator.free(detail);
+                    try out_fs.add(.{
+                        .rule_id = "SO-DEP-002",
+                        .artifact = path,
+                        .detail = detail,
+                        .func_name = item.mod_name,
+                    });
+                },
+                .ok, .ec_bridge_ok => {},
+            }
+            continue;
+        }
+
+        var sub_analysis = analyzeImports(allocator, child_bytes) catch continue;
+        defer sub_analysis.deinit();
+
+        const compat = checkArchCompatibility(item.parent_machine, item.parent_ec, sub_analysis.machine, sub_analysis.is_arm64ec);
         switch (compat) {
             .machine_mismatch => {
-                const detail = try std.fmt.allocPrint(allocator, "{s} ({s}) cannot load incompatible {s} ({s})", .{
-                    finding.basename(path),
-                    @tagName(analysis.machine),
-                    mod.name,
-                    @tagName(child_img.machine),
-                });
+                const detail = if (item.is_direct)
+                    try std.fmt.allocPrint(allocator, "{s} ({s}) cannot load incompatible {s} ({s})", .{
+                        item.parent_name,
+                        @tagName(item.parent_machine),
+                        item.mod_name,
+                        @tagName(sub_analysis.machine),
+                    })
+                else
+                    try std.fmt.allocPrint(allocator, "Transitive mismatch: {s} -> {s} ({s}) -> {s} ({s})", .{
+                        root_base,
+                        item.parent_name,
+                        @tagName(item.parent_machine),
+                        item.mod_name,
+                        @tagName(sub_analysis.machine),
+                    });
                 defer allocator.free(detail);
                 try out_fs.add(.{
                     .rule_id = "SO-DEP-001",
                     .artifact = path,
                     .detail = detail,
-                    .func_name = mod.name,
+                    .func_name = item.mod_name,
                 });
             },
             .ec_mixed_warn => {
                 const detail = try std.fmt.allocPrint(allocator, "ARM64EC / native ARM64 transition between {s} and {s}; verify ARM64X pure forwarders", .{
-                    finding.basename(path),
-                    mod.name,
+                    item.parent_name,
+                    item.mod_name,
                 });
                 defer allocator.free(detail);
                 try out_fs.add(.{
                     .rule_id = "SO-DEP-002",
                     .artifact = path,
                     .detail = detail,
-                    .func_name = mod.name,
+                    .func_name = item.mod_name,
                 });
             },
             .ok, .ec_bridge_ok => {},
         }
 
-        if (recursive and visited.count() < 64) {
-            const b = finding.basename(mod.name);
-            if (!visited.contains(b)) {
-                try visited.put(b, {});
-                var sub_analysis = analyzeImports(allocator, child_bytes) catch continue;
-                defer sub_analysis.deinit();
-                for (sub_analysis.modules) |sub_mod| {
-                    if (sub_mod.is_system) continue;
-                    const sub_bytes = tryResolveDepFile(io, allocator, sub_mod.name, parent_dir, search_root) catch continue;
-                    defer allocator.free(sub_bytes);
-                    var sub_img = binary.parseBinary(allocator, sub_bytes) catch continue;
-                    defer sub_img.deinit();
-                    if (checkArchCompatibility(child_img.machine, child_img.is_arm64ec, sub_img.machine, sub_img.is_arm64ec) == .machine_mismatch) {
-                        const detail = try std.fmt.allocPrint(allocator, "Transitive mismatch: {s} -> {s} ({s}) -> {s} ({s})", .{
-                            finding.basename(path),
-                            mod.name,
-                            @tagName(child_img.machine),
-                            sub_mod.name,
-                            @tagName(sub_img.machine),
-                        });
-                        defer allocator.free(detail);
-                        try out_fs.add(.{
-                            .rule_id = "SO-DEP-001",
-                            .artifact = path,
-                            .detail = detail,
-                            .func_name = sub_mod.name,
-                        });
-                    }
-                }
-            }
+        for (sub_analysis.modules) |sub_mod| {
+            if (sub_mod.is_system) continue;
+            if (visited.count() >= 64) break;
+            const sub_key = try lowerBase(baa, sub_mod.name);
+            if (visited.contains(sub_key)) continue;
+            try visited.put(sub_key, {});
+            try queue.append(baa, .{
+                .parent_name = item.mod_name,
+                .mod_name = try baa.dupe(u8, sub_mod.name),
+                .parent_machine = sub_analysis.machine,
+                .parent_ec = sub_analysis.is_arm64ec,
+                .is_direct = false,
+            });
         }
     }
 

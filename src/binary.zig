@@ -22,6 +22,7 @@ pub const BinaryImage = struct {
     has_bti: bool,
     is_arm64ec: bool,
     min_segment_align: u32,
+    file_len: usize = std.math.maxInt(usize),
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *BinaryImage) void {
@@ -59,7 +60,8 @@ pub const BinaryImage = struct {
             if (rva >= sec.virtual_address and rva < sec.virtual_address +| span) {
                 const delta = rva - sec.virtual_address;
                 if (delta < sec.raw_size) {
-                    return @as(usize, sec.raw_offset) +| @as(usize, delta);
+                    const off = @as(usize, sec.raw_offset) +| @as(usize, delta);
+                    if (off < self.file_len) return off;
                 }
             }
         }
@@ -85,8 +87,9 @@ pub const BinaryImage = struct {
     }
 };
 
-/// Auto-detect PE32+, ELF64, or 64-bit Mach-O binary headers and normalize into `BinaryImage`.
-pub fn parseBinary(allocator: std.mem.Allocator, bytes: []const u8) !BinaryImage {
+/// Auto-detect PE32+, ELF64, or 64-bit Mach-O (including Universal Fat) binary headers and normalize into `BinaryImage`.
+pub fn parseBinary(allocator: std.mem.Allocator, raw_bytes: []const u8) !BinaryImage {
+    const bytes = macho.unwrapFatSlice(raw_bytes);
     if (bytes.len >= 4 and std.mem.eql(u8, bytes[0..4], "\x7fELF")) {
         const e = try elf.parseElf(allocator, bytes);
         return .{
@@ -102,6 +105,7 @@ pub fn parseBinary(allocator: std.mem.Allocator, bytes: []const u8) !BinaryImage
             .has_bti = e.has_bti,
             .is_arm64ec = false,
             .min_segment_align = e.min_segment_align,
+            .file_len = bytes.len,
             .allocator = e.allocator,
         };
     }
@@ -121,6 +125,7 @@ pub fn parseBinary(allocator: std.mem.Allocator, bytes: []const u8) !BinaryImage
             .has_bti = false,
             .is_arm64ec = false,
             .min_segment_align = 16384,
+            .file_len = bytes.len,
             .allocator = m.allocator,
         };
     }
@@ -139,6 +144,7 @@ pub fn parseBinary(allocator: std.mem.Allocator, bytes: []const u8) !BinaryImage
         .has_bti = false,
         .is_arm64ec = p.machine == .arm64ec,
         .min_segment_align = 4096,
+        .file_len = bytes.len,
         .allocator = p.allocator,
     };
 }

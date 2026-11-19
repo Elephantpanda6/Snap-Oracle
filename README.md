@@ -24,9 +24,9 @@ Instead of restarting processes or needing source code, `snap-oracle` parses PE3
 - **Deterministic `.data`/`.bss` Reset + Multi-Worker Scaling (`src/dll_snapshot.zig`, `src/pool.zig`, `src/worker.zig`)**:
   - Restores dirty writable target data pages after every run and minimization step, supports `--jobs N` multi-process corpus syncing, and provides framed `diff_protocol` stdio workers.
 
-## Enterprise ARM64 Compliance, Migration & DevSecOps Modules
+## ARM64 Compliance, Migration & Security Modules
 
-To support ISVs porting to Windows-on-ARM, Apple Silicon, Android 15+ (16K), and cloud Graviton/N1X fleets:
+Built for porting and auditing across Windows on ARM64, Apple Silicon, Android 15+ (16K), and Linux/cloud ARM64 systems:
 
 - **SARIF 2.1.0, JSON, JUnit & GitHub Actions Reporting (`src/finding.zig`, `src/report.zig`)**: Unified finding model with FNV-1a deduplication fingerprints, SHA-256 artifact hashes, CWE tags, and `report convert`.
 - **Cross-OS Dependency & ARM64EC Mixed-Arch Chain Scanner (`src/imports.zig`)**: Walks PE Import/Delay/CHPE (`ARM64EC`/`ARM64X`), ELF `PT_DYNAMIC`/`DT_NEEDED`, and Mach-O `LC_LOAD_DYLIB`/Universal Fat chains (`deps`).
@@ -36,7 +36,7 @@ To support ISVs porting to Windows-on-ARM, Apple Silicon, Android 15+ (16K), and
 - **ARM64 Vectorization & Performance Migration Advisor (`src/perfadvisor.zig`)**: Flags unvectorized scalar FP loops, LL/SC vs LSE contention, missing DotProd (`SDOT`)/`I8MM`/`BF16` compute instructions, and x64 VEX/EVEX SIMD paths (`perf-advise`).
 - **x64 -> ARM64 Source & Binary Porting Scanner (`src/portscan.zig`)**: Comment- and literal-aware C/C++/Rust/Zig scanner catching `_mm_*` intrinsics, `__rdtsc`, x86 inline asm, asymmetric `#ifdef _M_X64`, `volatile` weak-memory sync hazards, and `char` signedness (`portscan`).
 - **Defensive Crash Triage, Corpus Distillation & Coverage Exports (`src/crash_triage.zig`, `src/cmin.zig`, `src/covreport.zig`, `src/harnessgen.zig`, `src/symbols.zig`)**: Classifies crashes (PAC/BTI, null-deref, stack overflow, input-tainted writes), distills minimal corpora (`cmin --tmin`), exports **DrCov v2** (IDA/Ghidra/Binary Ninja Lighthouse), **LCOV**, and **HTML** hit-maps (`cov`), generates **C / Zig / Rust / Python** harnesses & standalone reproducers (`gen`), and demangles Itanium/MSVC C++ symbols (`sym`).
-- **CI Gates, Baselines, Crash DB, Benchmarks & Offline Ed25519 Licensing (`src/ci_gate.zig`, `src/crashdb.zig`, `src/bench.zig`, `src/license.zig`)**: CRC32-guarded finding DB (`crashdb`), fingerprint baseline suppression (`baseline`), expiring policy waivers & GitHub/GitLab/AzDO/Jenkins workflow generators (`ci`), statistical MAD hardware benchmarks (`bench`), and offline Ed25519 commercial license verification (`license`).
+- **CI Gates, Baselines, Crash DB, Benchmarks & Offline Ed25519 Licensing (`src/ci_gate.zig`, `src/crashdb.zig`, `src/bench.zig`, `src/license.zig`)**: CRC32-guarded finding DB (`crashdb`), fingerprint baseline suppression (`baseline`), expiring policy waivers & GitHub/GitLab/AzDO/Jenkins workflow generators (`ci`), statistical MAD hardware benchmarks (`bench`), and offline Ed25519 license verification (`license`).
 
 ## Build
 
@@ -87,7 +87,7 @@ mkdir corp
 # Differential execution across two binaries (or via `worker` over stdio/SSH)
 .\zig-out\bin\snap-oracle.exe diff --a build_a.dll --b build_b.dll --entry arm64_abi_probe --iters 10000
 
-# Enterprise ARM64 Compliance, Porting, Triage & CI/CD Workflows
+# ARM64 Compliance, Porting, Triage & CI/CD Workflows
 .\zig-out\bin\snap-oracle.exe harden .\zig-out\bin\test_target.dll --format sarif --out harden.sarif --fail-on high
 .\zig-out\bin\snap-oracle.exe pagesize .\zig-out\bin\test_target.dll --fix-hints
 .\zig-out\bin\snap-oracle.exe deps .\zig-out\bin\test_target.dll --recursive
@@ -108,8 +108,4 @@ See [docs/ARM64_ARCHITECTURE_AND_LAPTOPS.md](docs/ARM64_ARCHITECTURE_AND_LAPTOPS
 
 ## License
 
-**Non-Commercial & Authorized-Use License (Paid Commercial License Required for Companies)** — see [LICENSE](LICENSE).
-
-- **Individuals & Non-Commercial Users**: Free for personal, educational, academic, and non-commercial research use on systems/binaries you own or have explicit permission to test.
-- **Companies & Commercial Use**: Strictly prohibited without a **paid Commercial License** from the copyright holder (`Elephantpanda6`).
-- **Author Protection & Disclaimer**: Provided "AS IS" strictly for lawful, authorized testing; the author (`Elephantpanda6`) bears no responsibility or liability for any activities performed by users, who assume sole legal responsibility and agree to indemnify the author.
+See [LICENSE](LICENSE) for full licensing terms, authorized-use requirements, and liability disclaimers.

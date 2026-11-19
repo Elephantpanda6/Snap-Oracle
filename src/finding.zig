@@ -1,7 +1,7 @@
 const std = @import("std");
 
 pub const TOOL_NAME = "Snap-Oracle";
-pub const TOOL_VERSION = "0.3.0-enterprise-arm64";
+pub const TOOL_VERSION = "0.3.0-arm64";
 pub const HELP_BASE_URI = "https://github.com/Elephantpanda6/snap-oracle/blob/main/docs/ARM64_ARCHITECTURE_AND_LAPTOPS.md";
 
 pub const Severity = enum(u8) {
@@ -469,6 +469,7 @@ pub const Finding = struct {
     artifact: []const u8,
     rva: ?u32 = null,
     file_offset: ?u32 = null,
+    line: ?u32 = null,
     func_name: ?[]const u8 = null,
     remediation: []const u8,
     cwe: ?u16 = null,
@@ -484,6 +485,7 @@ pub const AddOptions = struct {
     artifact: []const u8,
     rva: ?u32 = null,
     file_offset: ?u32 = null,
+    line: ?u32 = null,
     func_name: ?[]const u8 = null,
     remediation: ?[]const u8 = null,
     cwe: ?u16 = null,
@@ -522,7 +524,13 @@ pub const FindingSet = struct {
         const rem_duped = try aa.dupe(u8, rem_src);
         const fn_duped: ?[]const u8 = if (opts.func_name) |fn_name| try aa.dupe(u8, fn_name) else null;
 
-        const fp = computeFingerprint(rule_duped, artifact_duped, fn_duped orelse "", opts.rva orelse 0);
+        const loc: u64 = if (opts.rva) |r|
+            @as(u64, r)
+        else if (opts.line) |l|
+            @as(u64, l)
+        else
+            @as(u64, opts.file_offset orelse 0);
+        const fp = computeFingerprint(rule_duped, artifact_duped, fn_duped orelse "", loc, detail_duped);
 
         try self.items.append(self.allocator, .{
             .rule_id = rule_duped,
@@ -533,6 +541,7 @@ pub const FindingSet = struct {
             .artifact = artifact_duped,
             .rva = opts.rva,
             .file_offset = opts.file_offset,
+            .line = opts.line,
             .func_name = fn_duped,
             .remediation = rem_duped,
             .cwe = cwe_val,
@@ -583,7 +592,7 @@ pub fn basename(path: []const u8) []const u8 {
     return path;
 }
 
-pub fn computeFingerprint(rule_id: []const u8, artifact: []const u8, func_name: []const u8, rva: u32) u64 {
+pub fn computeFingerprint(rule_id: []const u8, artifact: []const u8, func_name: []const u8, loc: u64, detail: []const u8) u64 {
     var h = std.hash.Fnv1a_64.init();
     h.update(rule_id);
     h.update("|");
@@ -591,9 +600,13 @@ pub fn computeFingerprint(rule_id: []const u8, artifact: []const u8, func_name: 
     h.update("|");
     h.update(func_name);
     if (func_name.len == 0) {
-        var buf: [4]u8 = undefined;
-        std.mem.writeInt(u32, &buf, rva, .little);
+        var buf: [8]u8 = undefined;
+        std.mem.writeInt(u64, &buf, loc, .little);
         h.update(&buf);
+        if (loc == 0) {
+            h.update("|");
+            h.update(detail);
+        }
     }
     return h.final();
 }
@@ -612,23 +625,59 @@ pub fn sha256Hex(bytes: []const u8) [64]u8 {
 
 pub fn appendJsonEscaped(list: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u8) !void {
     try list.append(allocator, '"');
-    for (s) |c| {
+    var i: usize = 0;
+    while (i < s.len) {
+        const c = s[i];
         switch (c) {
-            '"' => try list.appendSlice(allocator, "\\\""),
-            '\\' => try list.appendSlice(allocator, "\\\\"),
-            '\n' => try list.appendSlice(allocator, "\\n"),
-            '\r' => try list.appendSlice(allocator, "\\r"),
-            '\t' => try list.appendSlice(allocator, "\\t"),
+            '"' => {
+                try list.appendSlice(allocator, "\\\"");
+                i += 1;
+            },
+            '\\' => {
+                try list.appendSlice(allocator, "\\\\");
+                i += 1;
+            },
+            '\x08' => {
+                try list.appendSlice(allocator, "\\b");
+                i += 1;
+            },
+            '\x0C' => {
+                try list.appendSlice(allocator, "\\f");
+                i += 1;
+            },
+            '\n' => {
+                try list.appendSlice(allocator, "\\n");
+                i += 1;
+            },
+            '\r' => {
+                try list.appendSlice(allocator, "\\r");
+                i += 1;
+            },
+            '\t' => {
+                try list.appendSlice(allocator, "\\t");
+                i += 1;
+            },
             else => {
-                if (c < 0x20) {
+                if (c < 0x20 or c == 0x7F) {
                     var buf: [6]u8 = undefined;
                     const esc = try std.fmt.bufPrint(&buf, "\\u{x:0>4}", .{c});
                     try list.appendSlice(allocator, esc);
+                    i += 1;
                 } else if (c >= 0x80) {
-                    // Keep valid UTF-8 sequences readable; normalize isolated control-like high bytes
-                    try list.append(allocator, c);
+                    if (std.unicode.utf8ByteSequenceLength(c)) |seq_len| {
+                        if (i + seq_len <= s.len) {
+                            if (std.unicode.utf8Decode(s[i .. i + seq_len])) |_| {
+                                try list.appendSlice(allocator, s[i .. i + seq_len]);
+                                i += seq_len;
+                                continue;
+                            } else |_| {}
+                        }
+                    } else |_| {}
+                    try list.appendSlice(allocator, "\\uFFFD");
+                    i += 1;
                 } else {
                     try list.append(allocator, c);
+                    i += 1;
                 }
             },
         }

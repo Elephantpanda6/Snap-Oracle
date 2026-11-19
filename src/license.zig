@@ -2,27 +2,27 @@ const std = @import("std");
 const finding = @import("finding.zig");
 
 pub const LicenseTier = enum {
-    community_non_commercial,
-    team_commercial,
-    enterprise_commercial,
+    community,
+    team,
+    organization,
 
     pub fn toString(self: LicenseTier) []const u8 {
         return switch (self) {
-            .community_non_commercial => "community_non_commercial",
-            .team_commercial => "team",
-            .enterprise_commercial => "enterprise",
+            .community => "community",
+            .team => "team",
+            .organization => "organization",
         };
     }
 
     pub fn fromString(s: []const u8) ?LicenseTier {
-        if (finding.eqlIgnoreCase(s, "community") or finding.eqlIgnoreCase(s, "community_non_commercial")) {
-            return .community_non_commercial;
+        if (finding.eqlIgnoreCase(s, "community") or finding.eqlIgnoreCase(s, "personal")) {
+            return .community;
         }
-        if (finding.eqlIgnoreCase(s, "team") or finding.eqlIgnoreCase(s, "team_commercial")) {
-            return .team_commercial;
+        if (finding.eqlIgnoreCase(s, "team")) {
+            return .team;
         }
-        if (finding.eqlIgnoreCase(s, "enterprise") or finding.eqlIgnoreCase(s, "enterprise_commercial")) {
-            return .enterprise_commercial;
+        if (finding.eqlIgnoreCase(s, "organization") or finding.eqlIgnoreCase(s, "org") or finding.eqlIgnoreCase(s, "standard")) {
+            return .organization;
         }
         return null;
     }
@@ -47,13 +47,26 @@ pub const LicenseToken = struct {
 pub const VerifyOutcome = struct {
     valid: bool,
     reason: []const u8,
-    tier: LicenseTier = .community_non_commercial,
-    org: []const u8 = "",
+    tier: LicenseTier = .community,
+    org_buf: [256]u8 = @splat(0),
+    org_len: usize = 0,
     seats: u32 = 0,
     expires_ymd: u32 = 0,
+
+    pub fn org(self: *const VerifyOutcome) []const u8 {
+        return self.org_buf[0..self.org_len];
+    }
+
+    fn setOrg(self: *VerifyOutcome, name: []const u8) void {
+        const n = @min(name.len, self.org_buf.len);
+        @memcpy(self.org_buf[0..n], name[0..n]);
+        self.org_len = n;
+    }
 };
 
 pub fn canonicalMessage(allocator: std.mem.Allocator, org: []const u8, tier: LicenseTier, seats: u32, expires: []const u8, features_mask: u32) ![]u8 {
+    if (std.mem.indexOfScalar(u8, org, '|') != null) return error.InvalidLicenseOrg;
+    if (parseYmd(expires) == null) return error.InvalidExpiryDate;
     return std.fmt.allocPrint(allocator, "SNAP-ORACLE-LIC|v1|{s}|{s}|{d}|{s}|0x{x:0>8}", .{
         org,
         tier.toString(),
@@ -63,20 +76,44 @@ pub fn canonicalMessage(allocator: std.mem.Allocator, org: []const u8, tier: Lic
     });
 }
 
+fn isAllDigits(s: []const u8) bool {
+    for (s) |c| {
+        if (!std.ascii.isDigit(c)) return false;
+    }
+    return true;
+}
+
+fn daysInMonth(y: u32, m: u32) u32 {
+    return switch (m) {
+        1, 3, 5, 7, 8, 10, 12 => 31,
+        4, 6, 9, 11 => 30,
+        2 => if ((y % 4 == 0 and y % 100 != 0) or (y % 400 == 0)) 29 else 28,
+        else => 0,
+    };
+}
+
 pub fn parseYmd(s: []const u8) ?u32 {
-    // Accepts "YYYY-MM-DD" or "YYYYMMDD"
+    // Accepts "YYYY-MM-DD" or "YYYYMMDD" with strict calendar validation
+    var y: u32 = 0;
+    var m: u32 = 0;
+    var d: u32 = 0;
     if (s.len == 10 and s[4] == '-' and s[7] == '-') {
-        const y = std.fmt.parseInt(u32, s[0..4], 10) catch return null;
-        const m = std.fmt.parseInt(u32, s[5..7], 10) catch return null;
-        const d = std.fmt.parseInt(u32, s[8..10], 10) catch return null;
-        if (m < 1 or m > 12 or d < 1 or d > 31) return null;
-        return y * 10000 + m * 100 + d;
+        if (!isAllDigits(s[0..4]) or !isAllDigits(s[5..7]) or !isAllDigits(s[8..10])) return null;
+        y = std.fmt.parseInt(u32, s[0..4], 10) catch return null;
+        m = std.fmt.parseInt(u32, s[5..7], 10) catch return null;
+        d = std.fmt.parseInt(u32, s[8..10], 10) catch return null;
+    } else if (s.len == 8) {
+        if (!isAllDigits(s)) return null;
+        y = std.fmt.parseInt(u32, s[0..4], 10) catch return null;
+        m = std.fmt.parseInt(u32, s[4..6], 10) catch return null;
+        d = std.fmt.parseInt(u32, s[6..8], 10) catch return null;
+    } else {
+        return null;
     }
-    if (s.len == 8) {
-        const v = std.fmt.parseInt(u32, s, 10) catch return null;
-        return v;
-    }
-    return null;
+    if (y < 1970 or y > 9999 or m < 1 or m > 12) return null;
+    const max_d = daysInMonth(y, m);
+    if (d < 1 or d > max_d) return null;
+    return y * 10000 + m * 100 + d;
 }
 
 pub fn generateDemoSignedTokenJson(
@@ -88,6 +125,9 @@ pub fn generateDemoSignedTokenJson(
     expires: []const u8,
     deterministic_seed: ?[32]u8,
 ) ![]u8 {
+    if (std.mem.indexOfScalar(u8, org, '|') != null) return error.InvalidLicenseOrg;
+    if (parseYmd(expires) == null) return error.InvalidExpiryDate;
+
     const Ed25519 = std.crypto.sign.Ed25519;
     const kp = if (deterministic_seed) |s|
         try Ed25519.KeyPair.generateDeterministic(s)
@@ -138,6 +178,13 @@ pub fn verifyTokenJson(
     defer parsed.deinit();
 
     const tok = parsed.value;
+    if (std.mem.indexOfScalar(u8, tok.org, '|') != null) {
+        return .{
+            .valid = false,
+            .reason = "Organization name contains forbidden '|' delimiter",
+        };
+    }
+
     const tier = LicenseTier.fromString(tok.tier) orelse return .{
         .valid = false,
         .reason = "Unknown license tier",
@@ -149,13 +196,15 @@ pub fn verifyTokenJson(
     };
 
     if (current_ymd > 0 and exp_ymd < current_ymd) {
-        return .{
+        var expired_out = VerifyOutcome{
             .valid = false,
             .reason = "License has expired",
             .tier = tier,
             .expires_ymd = exp_ymd,
             .seats = tok.seats,
         };
+        expired_out.setOrg(tok.org);
+        return expired_out;
     }
 
     if (tok.pubkey_hex.len != 64 or tok.sig_hex.len != 128) {
@@ -184,14 +233,18 @@ pub fn verifyTokenJson(
         return .{ .valid = false, .reason = "Ed25519 signature verification FAILED" };
     };
 
-    return .{
+    var out = VerifyOutcome{
         .valid = true,
-        .reason = "Valid offline Ed25519-signed license",
+        .reason = if (expected_pubkey_hex != null)
+            "Valid offline Ed25519-signed license"
+        else
+            "Self-signed token format valid (unpinned pubkey; trust unverified)",
         .tier = tier,
-        .org = tok.org,
         .seats = tok.seats,
         .expires_ymd = exp_ymd,
     };
+    out.setOrg(tok.org);
+    return out;
 }
 
 fn bytesToHex32(bytes: *const [32]u8) [64]u8 {
@@ -216,11 +269,9 @@ fn bytesToHex64(bytes: *const [64]u8) [128]u8 {
 
 pub fn printTerms() void {
     std.debug.print(
-        \\=== Snap-Oracle Commercial & Non-Commercial Licensing Summary ===
-        \\Author / Licensor : Elephantpanda6
-        \\Non-Commercial Tier : Free for personal, academic, and individual non-commercial security research.
-        \\Commercial Tier     : Requires a paid commercial license per organization/seat before internal, CI/CD,
-        \\                      client-facing, or SaaS business use.
+        \\=== Snap-Oracle Licensing & Authorized-Use Summary ===
+        \\Author / Licensor   : Elephantpanda6
+        \\License Terms       : See LICENSE for full permissions, restrictions, and usage terms.
         \\Authorized Use Only : Only scan/fuzz binaries and source repositories you own or have written authorization to test.
         \\Liability & Warranty: PROVIDED "AS IS" WITHOUT WARRANTY; Author is held harmless and indemnified against
         \\                      misuse, operational downtime, or third-party claims (see LICENSE for full legal text).
@@ -236,8 +287,8 @@ pub fn runLicenseCommand(io: std.Io, allocator: std.mem.Allocator, args: []const
 
     const sub = args[0];
     if (std.mem.eql(u8, sub, "keygen-demo")) {
-        var org: []const u8 = "Acme ARM64 Corp (Evaluation Demo)";
-        var tier: LicenseTier = .enterprise_commercial;
+        var org: []const u8 = "Sample ARM64 Lab (Evaluation Demo)";
+        var tier: LicenseTier = .organization;
         var seats: u32 = 25;
         var expires: []const u8 = "2027-12-31";
         var out_path: ?[]const u8 = null;
@@ -249,7 +300,7 @@ pub fn runLicenseCommand(io: std.Io, allocator: std.mem.Allocator, args: []const
                 org = args[i];
             } else if (std.mem.eql(u8, args[i], "--tier") and i + 1 < args.len) {
                 i += 1;
-                tier = LicenseTier.fromString(args[i]) orelse .enterprise_commercial;
+                tier = LicenseTier.fromString(args[i]) orelse .organization;
             } else if (std.mem.eql(u8, args[i], "--seats") and i + 1 < args.len) {
                 i += 1;
                 seats = std.fmt.parseInt(u32, args[i], 10) catch 25;

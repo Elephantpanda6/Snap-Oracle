@@ -27,6 +27,7 @@ pub const JsonFindingDto = struct {
     artifact: []const u8 = "",
     rva: ?u32 = null,
     file_offset: ?u32 = null,
+    line: ?u32 = null,
     func_name: ?[]const u8 = null,
     remediation: []const u8 = "",
     cwe: ?u16 = null,
@@ -69,8 +70,9 @@ pub fn parseJsonReportIntoFindingSet(
             .artifact = item.artifact,
             .rva = item.rva,
             .file_offset = item.file_offset,
+            .line = item.line,
             .func_name = item.func_name,
-            .remediation = item.remediation,
+            .remediation = if (item.remediation.len > 0) item.remediation else null,
             .cwe = item.cwe,
         });
     }
@@ -151,6 +153,9 @@ fn renderText(allocator: std.mem.Allocator, fs: *const finding.FindingSet) ![]u8
         if (f.rva) |rva| {
             try appendFmt(&out, allocator, " | RVA: 0x{x}", .{rva});
         }
+        if (f.line) |ln| {
+            try appendFmt(&out, allocator, " | Line: {d}", .{ln});
+        }
         if (f.cwe) |cwe| {
             try appendFmt(&out, allocator, " | CWE-{d}", .{cwe});
         }
@@ -213,6 +218,12 @@ fn renderJson(allocator: std.mem.Allocator, fs: *const finding.FindingSet, artif
         try out.appendSlice(allocator, ",\n      \"file_offset\": ");
         if (f.file_offset) |fo| {
             try appendFmt(&out, allocator, "{d}", .{fo});
+        } else {
+            try out.appendSlice(allocator, "null");
+        }
+        try out.appendSlice(allocator, ",\n      \"line\": ");
+        if (f.line) |ln| {
+            try appendFmt(&out, allocator, "{d}", .{ln});
         } else {
             try out.appendSlice(allocator, "null");
         }
@@ -332,9 +343,17 @@ fn renderSarif(allocator: std.mem.Allocator, fs: *const finding.FindingSet, arti
         try finding.appendJsonEscaped(&out, allocator, msg);
         try out.appendSlice(allocator, " },\n          \"locations\": [{\n            \"physicalLocation\": {\n              \"artifactLocation\": { \"uri\": ");
         try finding.appendJsonEscaped(&out, allocator, finding.basename(f.artifact));
-        try out.appendSlice(allocator, " },\n              \"region\": { \"byteOffset\": ");
-        try appendFmt(&out, allocator, "{d}", .{f.file_offset orelse (f.rva orelse 0)});
-        try out.appendSlice(allocator, " }\n            }\n          }],\n          \"partialFingerprints\": { \"primaryLocationLineHash\": ");
+        if (f.line) |ln| {
+            if (f.file_offset) |fo| {
+                try appendFmt(&out, allocator, " }},\n              \"region\": {{ \"startLine\": {d}, \"byteOffset\": {d} }}\n            }}\n          }}],\n          \"partialFingerprints\": {{ \"primaryLocationLineHash\": ", .{ @max(ln, 1), fo });
+            } else {
+                try appendFmt(&out, allocator, " }},\n              \"region\": {{ \"startLine\": {d} }}\n            }}\n          }}],\n          \"partialFingerprints\": {{ \"primaryLocationLineHash\": ", .{@max(ln, 1)});
+            }
+        } else {
+            try out.appendSlice(allocator, " },\n              \"region\": { \"byteOffset\": ");
+            try appendFmt(&out, allocator, "{d}", .{f.file_offset orelse (f.rva orelse 0)});
+            try out.appendSlice(allocator, " }\n            }\n          }],\n          \"partialFingerprints\": { \"primaryLocationLineHash\": ");
+        }
         var fp_buf: [16]u8 = undefined;
         const fp_hex = try std.fmt.bufPrint(&fp_buf, "{x:0>16}", .{f.fingerprint});
         try finding.appendJsonEscaped(&out, allocator, fp_hex);
@@ -397,6 +416,19 @@ fn renderJunit(allocator: std.mem.Allocator, fs: *const finding.FindingSet) ![]u
     return out.toOwnedSlice(allocator);
 }
 
+fn appendGhaEscaped(list: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u8, is_property: bool) !void {
+    for (s) |c| {
+        switch (c) {
+            '%' => try list.appendSlice(allocator, "%25"),
+            '\r' => try list.appendSlice(allocator, "%0D"),
+            '\n' => try list.appendSlice(allocator, "%0A"),
+            ':' => if (is_property) try list.appendSlice(allocator, "%3A") else try list.append(allocator, c),
+            ',' => if (is_property) try list.appendSlice(allocator, "%2C") else try list.append(allocator, c),
+            else => try list.append(allocator, c),
+        }
+    }
+}
+
 fn renderGha(allocator: std.mem.Allocator, fs: *const finding.FindingSet) ![]u8 {
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
@@ -407,14 +439,18 @@ fn renderGha(allocator: std.mem.Allocator, fs: *const finding.FindingSet) ![]u8 
             .medium => "warning",
             .low, .info => "notice",
         };
-        try appendFmt(&out, allocator, "::{s} file={s},title={s} ({s})::{s} — Fix: {s}\n", .{
-            level,
-            finding.basename(f.artifact),
-            f.rule_id,
-            f.severity.toString(),
-            f.detail,
-            f.remediation,
-        });
+        try appendFmt(&out, allocator, "::{s} file=", .{level});
+        try appendGhaEscaped(&out, allocator, finding.basename(f.artifact), true);
+        if (f.line) |ln| {
+            try appendFmt(&out, allocator, ",line={d}", .{@max(ln, 1)});
+        }
+        try out.appendSlice(allocator, ",title=");
+        try appendGhaEscaped(&out, allocator, f.rule_id, true);
+        try appendFmt(&out, allocator, " ({s})::", .{f.severity.toString()});
+        try appendGhaEscaped(&out, allocator, f.detail, false);
+        try out.appendSlice(allocator, " — Fix: ");
+        try appendGhaEscaped(&out, allocator, f.remediation, false);
+        try out.append(allocator, '\n');
     }
     return out.toOwnedSlice(allocator);
 }

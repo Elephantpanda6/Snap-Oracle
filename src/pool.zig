@@ -31,7 +31,7 @@ pub fn runPoolFuzz(
         }
     }
 
-    const per_worker = (total_iters + worker_count - 1) / worker_count;
+    const per_worker = std.math.divCeil(usize, total_iters, worker_count) catch total_iters;
     const iters_str = try std.fmt.allocPrint(allocator, "{d}", .{per_worker});
     defer allocator.free(iters_str);
     const max_in_str = try std.fmt.allocPrint(allocator, "{d}", .{max_input});

@@ -1,5 +1,6 @@
 const std = @import("std");
 const binary = @import("binary.zig");
+const macho = @import("macho_arm64.zig");
 const finding = @import("finding.zig");
 const pe = @import("pe.zig");
 
@@ -60,7 +61,8 @@ pub const SymbolTable = struct {
         }
 
         // 3. Optional COFF symbol table for unstripped MinGW/LLVM PE binaries
-        if (raw_bytes) |bytes| {
+        if (raw_bytes) |rb| {
+            const bytes = macho.unwrapFatSlice(rb);
             if (img.format == .pe32plus) {
                 try appendPeCoffSymbols(aa, bytes, img, do_demangle, &by_rva);
             }
@@ -261,6 +263,14 @@ fn demangleItanium(allocator: std.mem.Allocator, body: []const u8) !?[]u8 {
                 break;
             }
         }
+    } else if (std.mem.startsWith(u8, cur, "St")) {
+        try parts.append(allocator, "std");
+        cur = cur[2..];
+        if (readItaniumLenIdent(&cur)) |ident| {
+            try parts.append(allocator, ident);
+        } else {
+            return null;
+        }
     } else if (readItaniumLenIdent(&cur)) |ident| {
         try parts.append(allocator, ident);
     } else {
@@ -321,12 +331,14 @@ fn demangleMsvc(allocator: std.mem.Allocator, body: []const u8) !?[]u8 {
 /// Extract source file names referenced inside a DWARF v2-v4 `.debug_line` section if present.
 pub fn extractDwarfSourceFiles(
     allocator: std.mem.Allocator,
-    raw_bytes: []const u8,
+    raw_bytes_in: []const u8,
     img: *const binary.BinaryImage,
 ) ![][]u8 {
+    const raw_bytes = macho.unwrapFatSlice(raw_bytes_in);
     const sec = img.findSection(".debug_line") orelse img.findSection("__debug_line") orelse return try allocator.alloc([]u8, 0);
-    if (sec.raw_offset +| sec.raw_size > raw_bytes.len) return try allocator.alloc([]u8, 0);
-    const data = raw_bytes[sec.raw_offset .. sec.raw_offset + sec.raw_size];
+    const sec_end = @as(u64, sec.raw_offset) + @as(u64, sec.raw_size);
+    if (sec_end > raw_bytes.len) return try allocator.alloc([]u8, 0);
+    const data = raw_bytes[@as(usize, sec.raw_offset)..@as(usize, @intCast(sec_end))];
 
     var files = std.ArrayList([]u8).empty;
     errdefer {
@@ -342,8 +354,9 @@ pub fn extractDwarfSourceFiles(
     while (off + 12 <= data.len and cu_guard < 512) : (cu_guard += 1) {
         const unit_len32 = std.mem.readInt(u32, data[off..][0..4], .little);
         if (unit_len32 == 0 or unit_len32 == 0xFFFF_FFFF) break;
-        const unit_end = off + 4 + @as(usize, unit_len32);
-        if (unit_end > data.len or off + 15 > unit_end) break;
+        const unit_end_u64 = @as(u64, off) + 4 + @as(u64, unit_len32);
+        if (unit_end_u64 > data.len or @as(u64, off) + 15 > unit_end_u64) break;
+        const unit_end: usize = @intCast(unit_end_u64);
 
         const version = std.mem.readInt(u16, data[off + 4 ..][0..2], .little);
         if (version < 2 or version > 4) {
@@ -352,7 +365,8 @@ pub fn extractDwarfSourceFiles(
         }
         const header_len = std.mem.readInt(u32, data[off + 6 ..][0..4], .little);
         var p: usize = off + 10;
-        const hdr_end = @min(unit_end, p + @as(usize, header_len));
+        const hdr_end_u64 = @min(@as(u64, unit_end), @as(u64, p) + @as(u64, header_len));
+        const hdr_end: usize = @intCast(hdr_end_u64);
         // Skip min_insn_len (1), max_ops (if v4: 1), default_is_stmt (1), line_base (1), line_range (1), opcode_base (1)
         const fixed_sz: usize = if (version >= 4) 6 else 5;
         if (p + fixed_sz > hdr_end) {
@@ -369,12 +383,21 @@ pub fn extractDwarfSourceFiles(
         p += std_opcode_cnt;
 
         // Skip include directories list (null-terminated strings ending in empty string)
+        var found_dir_term = false;
         var dir_guard: usize = 0;
-        while (p < hdr_end and data[p] != 0 and dir_guard < 256) : (dir_guard += 1) {
+        while (p < hdr_end and dir_guard < 256) : (dir_guard += 1) {
+            if (data[p] == 0) {
+                p += 1;
+                found_dir_term = true;
+                break;
+            }
             const z = std.mem.indexOfScalarPos(u8, data[0..hdr_end], p, 0) orelse break;
             p = z + 1;
         }
-        if (p < hdr_end and data[p] == 0) p += 1;
+        if (!found_dir_term) {
+            off = unit_end;
+            continue;
+        }
 
         // Read file_names entries: name (null-terminated) + 3x ULEB128
         var file_guard: usize = 0;
@@ -389,6 +412,7 @@ pub fn extractDwarfSourceFiles(
             }
             if (fname.len > 0 and !seen.contains(fname)) {
                 const duped = try allocator.dupe(u8, fname);
+                errdefer allocator.free(duped);
                 try seen.put(duped, {});
                 try files.append(allocator, duped);
             }

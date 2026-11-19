@@ -167,9 +167,12 @@ pub fn classifyCrash(
                     .reason = "Non-canonical top pointer bits indicate poisoned PAC return/function pointer",
                 };
             }
-            if (res.access_type == 8 or res.fault_rva == 0) {
+            const is_exec_fault = (res.access_type == 8) or
+                (res.access_type == 0 and res.exception_addr == res.fault_addr) or
+                (res.exception_addr != 0 and res.exception_addr == res.fault_addr);
+            if (is_exec_fault) {
                 return .{
-                    .class = if (res.fault_rva == 0) .pc_corrupt else .wild_exec,
+                    .class = if (res.exception_addr == 0 or res.fault_addr == 0) .pc_corrupt else .wild_exec,
                     .rule_id = "SO-CRASH-002",
                     .severity = .critical,
                     .cwe = 119,
@@ -180,7 +183,7 @@ pub fn classifyCrash(
                     .reason = "Control-flow hijacked outside valid module bounds or DEP execution fault",
                 };
             }
-            if (res.fault_addr > 0 and res.fault_addr < 0x10000) {
+            if (res.fault_addr < 0x10000 and (res.fault_addr > 0 or res.access_type == 1 or res.access_type == 2)) {
                 return .{
                     .class = .null_deref,
                     .rule_id = "SO-CRASH-006",
@@ -325,8 +328,9 @@ pub fn runTriageCommand(io: std.Io, allocator: std.mem.Allocator, args: []const 
         const in_bytes = std.Io.Dir.cwd().readFileAlloc(io, p, allocator, .limited(64 * 1024)) catch continue;
         defer allocator.free(in_bytes);
 
-        @memcpy(arena.live_ptr[0..in_bytes.len], in_bytes);
-        const res = veh.runProtected(loaded.entry, arena.live_ptr, in_bytes.len);
+        const run_len = @min(in_bytes.len, arena.size);
+        if (run_len > 0) @memcpy(arena.live_ptr[0..run_len], in_bytes[0..run_len]);
+        const res = veh.runProtected(loaded.entry, arena.live_ptr, run_len);
         _ = arena.restoreDirtyPages() catch 0;
         _ = mod_snap.restore();
 

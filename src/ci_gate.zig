@@ -35,7 +35,7 @@ pub const WaiverDoc = struct {
 pub fn renderPipelineTemplate(provider: CiProvider) []const u8 {
     return switch (provider) {
         .github =>
-        \\name: Snap-Oracle ARM64 Enterprise Security Gate
+        \\name: Snap-Oracle ARM64 Security Gate
         \\on: [push, pull_request]
         \\jobs:
         \\  arm64-gate:
@@ -45,18 +45,24 @@ pub fn renderPipelineTemplate(provider: CiProvider) []const u8 {
         \\    runs-on: ${{ matrix.os }}
         \\    steps:
         \\      - uses: actions/checkout@v4
-        \\      - uses: goto-bus-stop/setup-zig@v2
+        \\      - uses: mlugg/setup-zig@v2
         \\        with:
         \\          version: 0.17.1
+        \\      - run: zig build test
         \\      - run: zig build -Doptimize=ReleaseFast
         \\      - name: Hardening & Page-Size Gate
+        \\        shell: bash
         \\        run: |
-        \\          ./zig-out/bin/snap-oracle harden ./zig-out/lib/test_target.* --format sarif --out harden.sarif --fail-on high
-        \\          ./zig-out/bin/snap-oracle pagesize ./zig-out/lib/test_target.* --fix-hints
-        \\          ./zig-out/bin/snap-oracle deps ./zig-out/lib/test_target.* --recursive
-        \\          ./zig-out/bin/snap-oracle sbom ./zig-out/lib/test_target.* --format cyclonedx --out bom.cdx.json
+        \\          TARGET="$(ls ./zig-out/bin/test_target.dll ./zig-out/lib/libtest_target.* 2>/dev/null | head -n 1)"
+        \\          ./zig-out/bin/snap-oracle harden "$TARGET" --format sarif --out harden.sarif --fail-on high
+        \\          ./zig-out/bin/snap-oracle pagesize "$TARGET" --targets 16k,64k --fix-hints
+        \\          ./zig-out/bin/snap-oracle deps "$TARGET" --recursive
+        \\          ./zig-out/bin/snap-oracle sbom "$TARGET" --format cyclonedx --out bom.cdx.json
         \\      - name: Time-boxed Snapshot Fuzzing
-        \\        run: ./zig-out/bin/snap-oracle fuzz ./zig-out/lib/test_target.* --max-execs 250000 --duration 60
+        \\        shell: bash
+        \\        run: |
+        \\          TARGET="$(ls ./zig-out/bin/test_target.dll ./zig-out/lib/libtest_target.* 2>/dev/null | head -n 1)"
+        \\          ./zig-out/bin/snap-oracle fuzz --target "$TARGET" --max-execs 250000 --duration 60
         \\      - uses: github/codeql-action/upload-sarif@v3
         \\        if: always()
         \\        with:
@@ -151,6 +157,7 @@ pub fn evaluateGate(
                 .artifact = f.artifact,
                 .rva = f.rva,
                 .file_offset = f.file_offset,
+                .line = f.line,
                 .func_name = f.func_name,
                 .remediation = f.remediation,
                 .cwe = f.cwe,
@@ -170,10 +177,10 @@ pub fn evaluateGate(
             effective_fail_on = finding.Severity.fromString(fo) orelse cli_fail_on;
         }
         max_new_cap = parsed_waivers.?.value.max_new;
-        if (today_ymd > 0) {
-            for (parsed_waivers.?.value.waivers) |w| {
-                const exp = license.parseYmd(w.expires) orelse 0;
-                if (exp > 0 and exp < today_ymd) expired_waivers += 1;
+        for (parsed_waivers.?.value.waivers) |w| {
+            const exp_opt = license.parseYmd(w.expires);
+            if (exp_opt == null or (today_ymd > 0 and exp_opt.? < today_ymd)) {
+                expired_waivers += 1;
             }
         }
     }
@@ -185,8 +192,8 @@ pub fn evaluateGate(
             for (pw.value.waivers) |w| {
                 if (!std.mem.eql(u8, w.rule_id, f.rule_id)) continue;
                 if (w.artifact.len > 0 and !std.mem.eql(u8, finding.basename(w.artifact), finding.basename(f.artifact))) continue;
-                const exp = license.parseYmd(w.expires) orelse 0;
-                if (today_ymd > 0 and exp > 0 and exp < today_ymd) continue; // Waiver expired!
+                const exp = license.parseYmd(w.expires) orelse continue; // Fail closed on malformed expiry!
+                if (today_ymd > 0 and exp < today_ymd) continue; // Waiver expired!
                 is_waived = true;
                 break;
             }
@@ -204,6 +211,7 @@ pub fn evaluateGate(
             .artifact = f.artifact,
             .rva = f.rva,
             .file_offset = f.file_offset,
+            .line = f.line,
             .func_name = f.func_name,
             .remediation = f.remediation,
             .cwe = f.cwe,
@@ -222,6 +230,19 @@ pub fn evaluateGate(
         .expired_waivers = expired_waivers,
         .remaining_failing = sev_hits,
     };
+}
+
+pub fn currentUtcYmd(io: std.Io) u32 {
+    const ts = std.Io.Timestamp.now(io, .real);
+    const secs_i64 = ts.toSeconds();
+    const secs: u64 = if (secs_i64 > 0) @intCast(secs_i64) else 0;
+    const epoch_secs = std.time.epoch.EpochSeconds{ .secs = secs };
+    const year_day = epoch_secs.getEpochDay().calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    const y: u32 = year_day.year;
+    const m: u32 = month_day.month.numeric();
+    const d: u32 = @as(u32, month_day.day_index) + 1;
+    return y * 10000 + m * 100 + d;
 }
 
 pub fn runCiCommand(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !u8 {
@@ -259,7 +280,7 @@ pub fn runCiCommand(io: std.Io, allocator: std.mem.Allocator, args: []const []co
         var base_path: ?[]const u8 = null;
         var policy_path: ?[]const u8 = null;
         var fail_on: finding.Severity = .high;
-        var today_ymd: u32 = 20261119;
+        var today_ymd: u32 = currentUtcYmd(io);
         var fmt: report.ReportFormat = .text;
         var out_path: ?[]const u8 = null;
 
@@ -280,7 +301,10 @@ pub fn runCiCommand(io: std.Io, allocator: std.mem.Allocator, args: []const []co
                 fail_on = finding.Severity.fromString(args[i]) orelse .high;
             } else if (std.mem.eql(u8, a, "--today") and i + 1 < args.len) {
                 i += 1;
-                today_ymd = license.parseYmd(args[i]) orelse 20261119;
+                today_ymd = license.parseYmd(args[i]) orelse {
+                    std.debug.print("[ci gate] invalid --today date '{s}' (expected YYYY-MM-DD or YYYYMMDD)\n", .{args[i]});
+                    return 2;
+                };
             } else if (std.mem.eql(u8, a, "--format") and i + 1 < args.len) {
                 i += 1;
                 fmt = report.ReportFormat.fromString(args[i]) orelse .text;

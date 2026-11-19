@@ -31,6 +31,10 @@ pub fn computeRecordCrc(rec: DbRecord) u32 {
     h.update(rec.title);
     h.update("|");
     h.update(rec.status);
+    h.update("|");
+    var count_buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &count_buf, rec.count, .little);
+    h.update(&count_buf);
     return h.final();
 }
 
@@ -44,8 +48,49 @@ fn writeFileAtomic(io: std.Io, allocator: std.mem.Allocator, dest_path: []const 
     const cwd = std.Io.Dir.cwd();
     try cwd.writeFile(io, .{ .sub_path = tmp_path, .data = data });
     cwd.rename(tmp_path, cwd, dest_path, io) catch {
-        try cwd.writeFile(io, .{ .sub_path = dest_path, .data = data });
+        cwd.writeFile(io, .{ .sub_path = dest_path, .data = data }) catch |err| {
+            cwd.deleteFile(io, tmp_path) catch {};
+            return err;
+        };
+        cwd.deleteFile(io, tmp_path) catch {};
     };
+}
+
+fn appendDupedDbRecord(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayList(DbRecord),
+    fp: []const u8,
+    rule_id: []const u8,
+    severity: []const u8,
+    artifact: []const u8,
+    title: []const u8,
+    count: u32,
+    status: []const u8,
+    crc32: u32,
+) !void {
+    const f_fp = try allocator.dupe(u8, fp);
+    errdefer allocator.free(f_fp);
+    const f_rule = try allocator.dupe(u8, rule_id);
+    errdefer allocator.free(f_rule);
+    const f_sev = try allocator.dupe(u8, severity);
+    errdefer allocator.free(f_sev);
+    const f_art = try allocator.dupe(u8, artifact);
+    errdefer allocator.free(f_art);
+    const f_title = try allocator.dupe(u8, title);
+    errdefer allocator.free(f_title);
+    const f_status = try allocator.dupe(u8, status);
+    errdefer allocator.free(f_status);
+
+    try list.append(allocator, .{
+        .fingerprint = f_fp,
+        .rule_id = f_rule,
+        .severity = f_sev,
+        .artifact = f_art,
+        .title = f_title,
+        .count = count,
+        .status = f_status,
+        .crc32 = crc32,
+    });
 }
 
 pub fn loadDbRecords(
@@ -77,20 +122,22 @@ pub fn loadDbRecords(
         const parsed = std.json.parseFromSlice(DbRecord, allocator, trimmed, .{ .ignore_unknown_fields = true }) catch continue;
         defer parsed.deinit();
         const v = parsed.value;
-        if (verify_crc and v.crc32 != 0 and computeRecordCrc(v) != v.crc32) {
-            // Skip corrupted / torn line safely
+        if (verify_crc and computeRecordCrc(v) != v.crc32) {
+            // Skip corrupted / torn line safely (including crc32 == 0)
             continue;
         }
-        try arena_list.append(allocator, .{
-            .fingerprint = try allocator.dupe(u8, v.fingerprint),
-            .rule_id = try allocator.dupe(u8, v.rule_id),
-            .severity = try allocator.dupe(u8, v.severity),
-            .artifact = try allocator.dupe(u8, v.artifact),
-            .title = try allocator.dupe(u8, v.title),
-            .count = v.count,
-            .status = try allocator.dupe(u8, v.status),
-            .crc32 = v.crc32,
-        });
+        try appendDupedDbRecord(
+            allocator,
+            &arena_list,
+            v.fingerprint,
+            v.rule_id,
+            v.severity,
+            v.artifact,
+            v.title,
+            v.count,
+            v.status,
+            v.crc32,
+        );
     }
     return arena_list;
 }
@@ -141,10 +188,16 @@ pub fn filterFindingsAgainstBaseline(
     const parsed = try std.json.parseFromSlice(BaselineDoc, allocator, baseline_json, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
 
+    var key_arena = std.heap.ArenaAllocator.init(allocator);
+    defer key_arena.deinit();
+    const ka = key_arena.allocator();
+
     var seen = std.StringHashMap(void).init(allocator);
     defer seen.deinit();
     for (parsed.value.fingerprints) |fp| {
-        try seen.put(fp, {});
+        const low = try ka.alloc(u8, fp.len);
+        for (fp, 0..) |c, idx| low[idx] = std.ascii.toLower(c);
+        try seen.put(low, {});
     }
 
     var suppressed: usize = 0;
@@ -164,6 +217,7 @@ pub fn filterFindingsAgainstBaseline(
             .artifact = f.artifact,
             .rva = f.rva,
             .file_offset = f.file_offset,
+            .line = f.line,
             .func_name = f.func_name,
             .remediation = f.remediation,
             .cwe = f.cwe,
@@ -235,7 +289,7 @@ pub fn runCrashDbCommand(io: std.Io, allocator: std.mem.Allocator, args: []const
             const fp_hex = try std.fmt.bufPrint(&fp_buf, "{x:0>16}", .{f.fingerprint});
             var found = false;
             for (records.items) |*rec| {
-                if (std.mem.eql(u8, rec.fingerprint, fp_hex)) {
+                if (finding.eqlIgnoreCase(rec.fingerprint, fp_hex)) {
                     rec.count += 1;
                     updated += 1;
                     found = true;
@@ -243,15 +297,18 @@ pub fn runCrashDbCommand(io: std.Io, allocator: std.mem.Allocator, args: []const
                 }
             }
             if (!found) {
-                try records.append(allocator, .{
-                    .fingerprint = try allocator.dupe(u8, fp_hex),
-                    .rule_id = try allocator.dupe(u8, f.rule_id),
-                    .severity = try allocator.dupe(u8, f.severity.toString()),
-                    .artifact = try allocator.dupe(u8, finding.basename(f.artifact)),
-                    .title = try allocator.dupe(u8, f.title),
-                    .count = 1,
-                    .status = try allocator.dupe(u8, "new"),
-                });
+                try appendDupedDbRecord(
+                    allocator,
+                    &records,
+                    fp_hex,
+                    f.rule_id,
+                    f.severity.toString(),
+                    finding.basename(f.artifact),
+                    f.title,
+                    1,
+                    "new",
+                    0,
+                );
                 added += 1;
             }
         }

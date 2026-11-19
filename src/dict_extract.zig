@@ -1,6 +1,7 @@
 const std = @import("std");
 const mutator = @import("mutator.zig");
 const binary = @import("binary.zig");
+const macho = @import("macho_arm64.zig");
 const pe = @import("pe.zig");
 const arm64_isa = @import("arm64_isa.zig");
 
@@ -117,7 +118,8 @@ pub fn extractArm64Immediates(code: []const u8, dict: *mutator.Dictionary) usize
 }
 
 /// Extract fuzzing dictionary tokens from a PE32+, ELF64, or Mach-O binary (`bytes`).
-pub fn extractFromBinary(allocator: std.mem.Allocator, bytes: []const u8, dict: *mutator.Dictionary) !usize {
+pub fn extractFromBinary(allocator: std.mem.Allocator, raw_bytes: []const u8, dict: *mutator.Dictionary) !usize {
+    const bytes = macho.unwrapFatSlice(raw_bytes);
     var img = try binary.parseBinary(allocator, bytes);
     defer img.deinit();
 

@@ -1,5 +1,6 @@
 const std = @import("std");
 const binary = @import("binary.zig");
+const macho = @import("macho_arm64.zig");
 const pe = @import("pe.zig");
 const arm64_isa = @import("arm64_isa.zig");
 const finding = @import("finding.zig");
@@ -44,10 +45,11 @@ pub const HardeningSummary = struct {
 pub fn auditHardening(
     allocator: std.mem.Allocator,
     path: []const u8,
-    bytes: []const u8,
+    raw_bytes: []const u8,
     level: AuditLevel,
     out_fs: *finding.FindingSet,
 ) !HardeningSummary {
+    const bytes = macho.unwrapFatSlice(raw_bytes);
     var img = try binary.parseBinary(allocator, bytes);
     defer img.deinit();
 
@@ -93,12 +95,23 @@ pub fn auditHardening(
 
     if (img.isArm64()) {
         const pac_thresh: u32 = if (level == .strict) 50 else 5;
-        if (!sum.pac_note_or_abi and sum.pacCoveragePct() < pac_thresh and sum.total_functions >= 8) {
-            const detail = try std.fmt.allocPrint(allocator, "PAC return-address signing coverage is {d}% ({d}/{d} functions) and PAC ABI/note metadata is absent", .{
-                sum.pacCoveragePct(),
-                sum.pac_prologue_funcs,
-                sum.total_functions,
-            });
+        const pac_fail = if (level == .strict)
+            (sum.pacCoveragePct() < pac_thresh and sum.total_functions >= 8)
+        else
+            (!sum.pac_note_or_abi and sum.pacCoveragePct() < pac_thresh and sum.total_functions >= 8);
+        if (pac_fail) {
+            const detail = if (sum.pac_note_or_abi)
+                try std.fmt.allocPrint(allocator, "PAC return-address signing coverage is {d}% ({d}/{d} functions, below 50% strict threshold despite PAC ABI/note metadata)", .{
+                    sum.pacCoveragePct(),
+                    sum.pac_prologue_funcs,
+                    sum.total_functions,
+                })
+            else
+                try std.fmt.allocPrint(allocator, "PAC return-address signing coverage is {d}% ({d}/{d} functions) and PAC ABI/note metadata is absent", .{
+                    sum.pacCoveragePct(),
+                    sum.pac_prologue_funcs,
+                    sum.total_functions,
+                });
             defer allocator.free(detail);
             try out_fs.add(.{
                 .rule_id = "SO-PAC-001",
@@ -108,12 +121,23 @@ pub fn auditHardening(
             });
         }
 
-        if (!sum.bti_note and sum.btiCoveragePct() < pac_thresh and sum.total_functions >= 8 and img.format != .pe32plus) {
-            const detail = try std.fmt.allocPrint(allocator, "BTI indirect-branch landing-pad coverage is {d}% ({d}/{d} functions) and BTI note is absent", .{
-                sum.btiCoveragePct(),
-                sum.bti_prologue_funcs,
-                sum.total_functions,
-            });
+        const bti_fail = if (level == .strict)
+            (sum.btiCoveragePct() < pac_thresh and sum.total_functions >= 8 and img.format != .pe32plus)
+        else
+            (!sum.bti_note and sum.btiCoveragePct() < pac_thresh and sum.total_functions >= 8 and img.format != .pe32plus);
+        if (bti_fail) {
+            const detail = if (sum.bti_note)
+                try std.fmt.allocPrint(allocator, "BTI indirect-branch landing-pad coverage is {d}% ({d}/{d} functions, below 50% strict threshold despite BTI note)", .{
+                    sum.btiCoveragePct(),
+                    sum.bti_prologue_funcs,
+                    sum.total_functions,
+                })
+            else
+                try std.fmt.allocPrint(allocator, "BTI indirect-branch landing-pad coverage is {d}% ({d}/{d} functions) and BTI note is absent", .{
+                    sum.btiCoveragePct(),
+                    sum.bti_prologue_funcs,
+                    sum.total_functions,
+                });
             defer allocator.free(detail);
             try out_fs.add(.{
                 .rule_id = "SO-BTI-001",
@@ -160,12 +184,57 @@ fn auditPeHardening(
     const opt_off = @as(u64, e_lfanew) + 24;
     if (opt_off + 72 > bytes.len) return;
     const opt = bytes[@intCast(opt_off)..];
+    const magic = std.mem.readInt(u16, opt[0..2], .little);
     const dll_chars = std.mem.readInt(u16, opt[70..72], .little);
 
     sum.aslr_pie = (dll_chars & 0x0040) != 0; // DYNAMIC_BASE
     sum.high_entropy_va = (dll_chars & 0x0020) != 0;
     sum.nx_stack = (dll_chars & 0x0100) != 0; // NX_COMPAT
-    sum.cfg_or_full_relro = (dll_chars & 0x4000) != 0; // GUARD_CF
+
+    const has_guard_cf_char = (dll_chars & 0x4000) != 0; // GUARD_CF
+    var cfg_instrumented = false;
+    var cfg_detail: []const u8 = "PE Control Flow Guard (IMAGE_DLLCHARACTERISTICS_GUARD_CF) is disabled";
+    if (has_guard_cf_char) {
+        if (magic == 0x20B or magic == 0x10B) {
+            const dd_off: usize = if (magic == 0x20B) 112 else 96;
+            const gf_off: usize = if (magic == 0x20B) 144 else 88;
+            const min_lc_sz: u32 = @intCast(gf_off + 4);
+            if (opt.len >= dd_off + 11 * 8) {
+                const num_rvas = std.mem.readInt(u32, opt[dd_off - 4 ..][0..4], .little);
+                if (num_rvas > 10) {
+                    const lc_rva = std.mem.readInt(u32, opt[dd_off + 10 * 8 ..][0..4], .little);
+                    if (lc_rva != 0) {
+                        if (img.rvaToOffset(lc_rva)) |lc_off| {
+                            if (@as(u64, lc_off) + min_lc_sz <= bytes.len) {
+                                const lc_size = std.mem.readInt(u32, bytes[lc_off..][0..4], .little);
+                                if (lc_size >= min_lc_sz) {
+                                    const guard_flags = std.mem.readInt(u32, bytes[lc_off + gf_off ..][0..4], .little);
+                                    if ((guard_flags & 0x0000_0100) != 0) { // IMAGE_GUARD_CF_INSTRUMENTED
+                                        cfg_instrumented = true;
+                                    } else {
+                                        cfg_detail = "PE GUARD_CF flag is set, but Load Config GuardFlags lacks IMAGE_GUARD_CF_INSTRUMENTED (0x100)";
+                                    }
+                                } else {
+                                    cfg_detail = "PE GUARD_CF flag is set, but Load Config Size is too small for GuardFlags";
+                                }
+                            } else {
+                                cfg_detail = "PE GUARD_CF flag is set, but Load Config Directory is truncated";
+                            }
+                        } else {
+                            cfg_detail = "PE GUARD_CF flag is set, but Load Config RVA does not map into image";
+                        }
+                    } else {
+                        cfg_detail = "PE GUARD_CF flag is set, but DataDirectory[10] (Load Config) is absent";
+                    }
+                } else {
+                    cfg_detail = "PE GUARD_CF flag is set, but DataDirectory[10] (Load Config) is absent";
+                }
+            } else {
+                cfg_detail = "PE GUARD_CF flag is set, but OptionalHeader is too short for Load Config";
+            }
+        }
+    }
+    sum.cfg_or_full_relro = cfg_instrumented;
 
     if (!sum.aslr_pie) {
         try out_fs.add(.{
@@ -185,7 +254,7 @@ fn auditPeHardening(
         try out_fs.add(.{
             .rule_id = "SO-HARDEN-003",
             .artifact = path,
-            .detail = "PE Control Flow Guard (IMAGE_DLLCHARACTERISTICS_GUARD_CF) is disabled",
+            .detail = cfg_detail,
         });
     }
 
@@ -237,8 +306,9 @@ fn auditElfHardening(
 
     var i: u16 = 0;
     while (i < e_phnum) : (i += 1) {
-        const off = e_phoff + @as(u64, i) * e_phentsize;
-        if (off + 56 > bytes.len or e_phentsize < 56) break;
+        const off = std.math.add(u64, e_phoff, @as(u64, i) * e_phentsize) catch break;
+        const off_end = std.math.add(u64, off, 56) catch break;
+        if (off_end > bytes.len or e_phentsize < 56) break;
         const ph = bytes[@intCast(off)..];
         const p_type = std.mem.readInt(u32, ph[0..4], .little);
         const p_flags = std.mem.readInt(u32, ph[4..8], .little);
@@ -267,10 +337,21 @@ fn auditElfHardening(
             }
         } else if (p_type == 0x6474_E552) { // PT_GNU_RELRO
             has_relro = true;
-        } else if (p_type == 2 and p_offset + p_filesz <= bytes.len) {
+        } else if (p_type == 2 and p_offset <= bytes.len and p_filesz <= bytes.len - p_offset) {
             dyn_off = @intCast(p_offset);
             dyn_sz = @intCast(p_filesz);
         }
+    }
+
+    if (!has_gnu_stack) {
+        sum.nx_stack = false;
+        try out_fs.add(.{
+            .rule_id = "SO-HARDEN-002",
+            .severity = .medium,
+            .confidence = .medium,
+            .artifact = path,
+            .detail = "ELF lacks PT_GNU_STACK header; explicit non-executable stack (-z noexecstack) not declared",
+        });
     }
 
     if (dyn_off > 0 and dyn_sz >= 16) {
@@ -320,16 +401,19 @@ fn auditElfHardening(
 fn auditMachoHardening(
     allocator: std.mem.Allocator,
     path: []const u8,
-    bytes: []const u8,
+    raw_bytes: []const u8,
     img: *const binary.BinaryImage,
     sum: *HardeningSummary,
     out_fs: *finding.FindingSet,
 ) !void {
+    const bytes = macho.unwrapFatSlice(raw_bytes);
     if (bytes.len < 32 or std.mem.readInt(u32, bytes[0..4], .little) != 0xFEED_FACF) return;
     const cpusubtype = std.mem.readInt(u32, bytes[8..12], .little);
+    const filetype = std.mem.readInt(u32, bytes[12..16], .little);
     const flags = std.mem.readInt(u32, bytes[24..28], .little);
 
-    sum.aslr_pie = (flags & 0x0020_0000) != 0; // MH_PIE
+    // MH_PIE or inherently position-independent MH_DYLIB (6) / MH_BUNDLE (8)
+    sum.aslr_pie = (flags & 0x0020_0000) != 0 or filetype == 6 or filetype == 8;
     sum.cfg_or_full_relro = sum.aslr_pie; // dyld chained fixups / two-level namespace
     if ((cpusubtype & 0xFF) == 2) sum.pac_note_or_abi = true; // arm64e
 
@@ -356,7 +440,7 @@ fn auditMachoHardening(
         if (off + 8 > bytes.len) break;
         const cmd = std.mem.readInt(u32, bytes[off..][0..4], .little);
         const cmdsize = std.mem.readInt(u32, bytes[off + 4 ..][0..4], .little);
-        if (cmdsize < 8 or off + cmdsize > bytes.len) break;
+        if (cmdsize < 8 or cmdsize > bytes.len - off) break;
 
         if (cmd == 0x19 and cmdsize >= 72) { // LC_SEGMENT_64
             const initprot = std.mem.readInt(u32, bytes[off + 60 ..][0..4], .little);
@@ -372,8 +456,9 @@ fn auditMachoHardening(
             sum.codesign_present = true;
             const dataoff = std.mem.readInt(u32, bytes[off + 8 ..][0..4], .little);
             const datasize = std.mem.readInt(u32, bytes[off + 12 ..][0..4], .little);
-            if (@as(u64, dataoff) + datasize <= bytes.len and datasize >= 12) {
-                const sb = bytes[dataoff .. dataoff + datasize];
+            const cs_end = @as(u64, dataoff) + @as(u64, datasize);
+            if (cs_end <= bytes.len and datasize >= 12) {
+                const sb = bytes[@as(usize, dataoff)..@as(usize, @intCast(cs_end))];
                 if (std.mem.readInt(u32, sb[0..4], .big) == 0xFADE_0CC0) {
                     const cnt = @min(std.mem.readInt(u32, sb[8..12], .big), 32);
                     var bi: u32 = 0;
@@ -381,8 +466,8 @@ fn auditMachoHardening(
                         const idx_off = 12 + @as(usize, bi) * 8;
                         if (idx_off + 8 > sb.len) break;
                         const blob_off = std.mem.readInt(u32, sb[idx_off + 4 ..][0..4], .big);
-                        if (blob_off + 16 <= sb.len and std.mem.readInt(u32, sb[blob_off..][0..4], .big) == 0xFADE_0C02) {
-                            const cs_flags = std.mem.readInt(u32, sb[blob_off + 12 ..][0..4], .big);
+                        if (@as(u64, blob_off) + 16 <= sb.len and std.mem.readInt(u32, sb[@as(usize, blob_off)..][0..4], .big) == 0xFADE_0C02) {
+                            const cs_flags = std.mem.readInt(u32, sb[@as(usize, blob_off) + 12 ..][0..4], .big);
                             if ((cs_flags & 0x10000) != 0) sum.hardened_runtime = true; // CS_RUNTIME
                         }
                     }

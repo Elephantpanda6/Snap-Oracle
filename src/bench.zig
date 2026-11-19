@@ -7,6 +7,7 @@ const mutator = @import("mutator.zig");
 const l1 = @import("l1_engine.zig");
 const runner = @import("runner.zig");
 const veh = @import("veh.zig");
+const dll_snapshot = @import("dll_snapshot.zig");
 const binary = @import("binary.zig");
 const finding = @import("finding.zig");
 
@@ -193,7 +194,8 @@ fn benchMutate(io: std.Io, allocator: std.mem.Allocator) !BenchMetric {
 }
 
 fn benchSnapshot(io: std.Io, allocator: std.mem.Allocator) !BenchMetric {
-    var arena = try l1.SnapshotArena.init(allocator, 64 * 1024);
+    const min_arena_sz = @max(@as(usize, 64 * 1024), 2 * std.heap.pageSize());
+    var arena = try l1.SnapshotArena.init(allocator, min_arena_sz);
     defer arena.deinit();
     arena.takeSnapshot();
 
@@ -205,7 +207,9 @@ fn benchSnapshot(io: std.Io, allocator: std.mem.Allocator) !BenchMetric {
         for (0..N_RESETS) |k| {
             // Dirty 2 pages per execution
             arena.live_ptr[0] = @truncate(k);
-            arena.live_ptr[4096] = @truncate(k >> 8);
+            if (arena.page_size < arena.size) {
+                arena.live_ptr[arena.page_size] = @truncate(k >> 8);
+            }
             sink +%= try arena.restoreDirtyPages();
         }
         const t1 = std.Io.Timestamp.now(io, .awake);
@@ -237,10 +241,16 @@ fn benchExec(io: std.Io, allocator: std.mem.Allocator, target_path: []const u8, 
     var guard = veh.Guard.init();
     defer guard.deinit();
 
+    veh.setTargetModuleBounds(loaded.base_addr, img.size_of_image);
+    defer veh.setTargetModuleBounds(0, 0);
+
     var arena = try l1.SnapshotArena.init(allocator, 64 * 1024);
     defer arena.deinit();
     @memcpy(arena.live_ptr[0..8], "BENCH_IN");
     arena.takeSnapshot();
+
+    var mod_snap = try dll_snapshot.ModuleDataSnapshot.init(allocator, loaded.base_addr, &img);
+    defer mod_snap.deinit();
 
     const N_EXECS: usize = 20_000;
     var sink: u64 = 0;
@@ -251,6 +261,7 @@ fn benchExec(io: std.Io, allocator: std.mem.Allocator, target_path: []const u8, 
             const r = veh.runProtected(loaded.entry, arena.live_ptr, 8);
             sink +%= r.ret_val;
             _ = arena.restoreDirtyPages() catch 0;
+            _ = mod_snap.restore();
         }
         const t1 = std.Io.Timestamp.now(io, .awake);
         if (iter >= 2) {
@@ -321,10 +332,14 @@ pub fn runBenchCommand(io: std.Io, allocator: std.mem.Allocator, args: []const [
     if (suite == .all or suite == .cfg) try metrics.append(allocator, try benchCfg(io, allocator));
     if (suite == .all or suite == .mutate) try metrics.append(allocator, try benchMutate(io, allocator));
     if (suite == .all or suite == .snapshot) try metrics.append(allocator, try benchSnapshot(io, allocator));
-    if (suite == .exec or (suite == .all and target_path != null)) {
-        if (target_path) |tp| {
-            try metrics.append(allocator, try benchExec(io, allocator, tp, entry_name));
-        }
+    if (suite == .exec) {
+        const tp = target_path orelse {
+            std.debug.print("[bench] --suite exec requires --target <binary>\n", .{});
+            return 2;
+        };
+        try metrics.append(allocator, try benchExec(io, allocator, tp, entry_name));
+    } else if (suite == .all and target_path != null) {
+        try metrics.append(allocator, try benchExec(io, allocator, target_path.?, entry_name));
     }
 
     const caps = arm_laptops.probeHostCapabilities();
@@ -390,7 +405,8 @@ pub fn runBenchCommand(io: std.Io, allocator: std.mem.Allocator, args: []const [
         for (metrics.items) |cur| {
             for (parsed.value.metrics) |base| {
                 if (!std.mem.eql(u8, cur.name, base.name)) continue;
-                const thresh = (base.median_ns * (100 + max_regress_pct)) / 100;
+                const thresh_u128 = (@as(u128, base.median_ns) * (100 + @as(u128, max_regress_pct))) / 100;
+                const thresh: u64 = @intCast(@min(thresh_u128, std.math.maxInt(u64)));
                 const noise_floor = @max(base.mad_ns, 1) * 3;
                 if (cur.median_ns > thresh and (cur.median_ns - base.median_ns) > noise_floor) {
                     regressed = true;

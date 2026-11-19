@@ -1,5 +1,6 @@
 const std = @import("std");
 const binary = @import("binary.zig");
+const macho = @import("macho_arm64.zig");
 const cfg = @import("cfg.zig");
 const runner = @import("runner.zig");
 const audit = @import("audit.zig");
@@ -42,7 +43,7 @@ fn hasFlag(args: []const []const u8, name: []const u8) bool {
 fn printUsage() void {
     std.debug.print(
         \\{s} {s} (ARM64-First Cross-OS Security Gate, Auditor & Snapshot Fuzzer)
-        \\Authorized Defensive & QA Testing Use Only. See LICENSE for Commercial Terms.
+        \\Authorized Defensive & QA Testing Use Only. See LICENSE for full terms.
         \\
         \\Core Discovery & Hardware:
         \\  snap-oracle inspect     <binary>                      Parse PE32+/ELF64/Mach-O headers & BBs
@@ -51,7 +52,7 @@ fn printUsage() void {
         \\  snap-oracle hwinfo                                    Probe live host ARM64 ISA/page-size/profile
         \\  snap-oracle profiles                                  List supported ARM64 laptop/server profiles
         \\
-        \\Enterprise ARM64 Compliance & Porting:
+        \\ARM64 Compliance & Porting:
         \\  snap-oracle deps        <binary> [--root dir]         PE/ARM64EC/ELF/Mach-O ABI dependency graph
         \\  snap-oracle pagesize    <binary> [--fix-hints]        4K/16K/64K kernel page-size readiness audit
         \\  snap-oracle harden      <binary> [--level strict]     PAC/BTI/CFG/RELRO/PIE/Codesign/MTE audit
@@ -70,7 +71,7 @@ fn printUsage() void {
         \\  snap-oracle bench       [--suite all|decode|cfg|mutate|snapshot|exec] [--json out]
         \\  snap-oracle worker      --target <bin> [--entry <fn>] [--bti-safe]
         \\
-        \\DevSecOps CI/CD & Licensing:
+        \\CI/CD, Baselines & Licensing:
         \\  snap-oracle report      convert <in.json> --format sarif|junit|gha|json|text
         \\  snap-oracle crashdb     <init|add|list|stats> [--db path] [--report json]
         \\  snap-oracle baseline    <create|diff> --report <json> [--baseline base.json]
@@ -81,8 +82,9 @@ fn printUsage() void {
 }
 
 fn cmdInspect(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !void {
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(128 * 1024 * 1024));
-    defer allocator.free(bytes);
+    const raw_bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(128 * 1024 * 1024));
+    defer allocator.free(raw_bytes);
+    const bytes = macho.unwrapFatSlice(raw_bytes);
 
     var img = try binary.parseBinary(allocator, bytes);
     defer img.deinit();
@@ -101,10 +103,11 @@ fn cmdInspect(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !void 
         if (text_sec.raw_offset < bytes.len and text_sec.raw_size > 0) {
             const avail = @min(@as(usize, text_sec.raw_size), bytes.len - text_sec.raw_offset);
             const code = bytes[text_sec.raw_offset .. text_sec.raw_offset + avail];
+            const text_end_u64 = @as(u64, text_sec.virtual_address) + avail;
             var total_bb: usize = 0;
             const sample_fns = @min(img.functions.len, 64);
             for (img.functions[0..sample_fns]) |f| {
-                if (f.begin_rva < text_sec.virtual_address or f.end_rva > text_sec.virtual_address + text_sec.raw_size) continue;
+                if (f.begin_rva < text_sec.virtual_address or @as(u64, f.end_rva) > text_end_u64) continue;
                 const bbs = switch (img.machine) {
                     .arm64, .arm64ec => try cfg.decodeArm64BasicBlocksEx(allocator, code, text_sec.virtual_address, f.begin_rva, f.end_rva, true),
                     .amd64 => try cfg.decodeX64BasicBlocksFull(allocator, code, text_sec.virtual_address, f.begin_rva, f.end_rva),
@@ -199,12 +202,17 @@ pub fn main(init: std.process.Init) !u8 {
             return 2;
         };
         const entry = getFlag(rest, "--entry") orelse "fuzz_entry";
-        const iters_str = getFlag(rest, "--iters") orelse "1000";
-        const iters = std.fmt.parseInt(usize, iters_str, 10) catch 1000;
-        const max_execs_str = getFlag(rest, "--max-execs") orelse "0";
-        const max_execs = std.fmt.parseInt(u64, max_execs_str, 10) catch 0;
+        const iters_flag = getFlag(rest, "--iters");
+        const max_execs_flag = getFlag(rest, "--max-execs");
         const dur_str = getFlag(rest, "--duration") orelse "0";
         const max_seconds = std.fmt.parseInt(u64, dur_str, 10) catch 0;
+        const max_execs = if (max_execs_flag) |ms| (std.fmt.parseInt(u64, ms, 10) catch 0) else 0;
+        const iters: usize = if (iters_flag) |is|
+            (std.fmt.parseInt(usize, is, 10) catch 1000)
+        else if (max_seconds > 0 and max_execs == 0)
+            std.math.maxInt(usize)
+        else
+            1000;
         const corpus_dir = getFlag(rest, "--corpus");
         const dict_path = getFlag(rest, "--dict");
         const max_in_str = getFlag(rest, "--max-input") orelse "4096";

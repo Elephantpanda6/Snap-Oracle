@@ -2,6 +2,8 @@ const std = @import("std");
 const pe = @import("pe.zig");
 
 const MH_MAGIC_64: u32 = 0xFEED_FACF;
+const FAT_MAGIC: u32 = 0xCAFE_BABE; // little-endian view: 0xBEBA_FECA (FAT_CIGAM)
+const FAT_MAGIC_64: u32 = 0xCAFE_BABF; // little-endian view: 0xBFBA_FECA (FAT_CIGAM_64)
 const CPU_TYPE_ARM64: u32 = 0x0100_000C;
 const CPU_TYPE_X86_64: u32 = 0x0100_0007;
 const CPU_SUBTYPE_ARM64E: u32 = 2;
@@ -55,6 +57,47 @@ fn readUleb128(b: []const u8, pos: *usize) ?u64 {
     return null;
 }
 
+/// Unwrap a Universal / Fat Mach-O container (`0xCAFEBABE` / `FAT_CIGAM` `0xBEBAFECA`, or
+/// 64-bit `0xCAFEBABF`), preferring the `CPU_TYPE_ARM64` slice and falling back to the
+/// first valid slice. Returns `bytes` unchanged if not a valid Fat container.
+pub fn unwrapFatSlice(bytes: []const u8) []const u8 {
+    if (bytes.len < 8) return bytes;
+    const be_magic = std.mem.readInt(u32, bytes[0..4], .big);
+    if (be_magic != FAT_MAGIC and be_magic != FAT_MAGIC_64) return bytes;
+
+    const is_64 = (be_magic == FAT_MAGIC_64);
+    const entry_sz: usize = if (is_64) 32 else 20;
+    const nfat = std.mem.readInt(u32, bytes[4..8], .big);
+    const count = @min(nfat, 16);
+
+    var arm64_slice: ?[]const u8 = null;
+    var first_slice: ?[]const u8 = null;
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        const off = 8 + @as(usize, i) * entry_sz;
+        if (off + entry_sz > bytes.len) break;
+        const cputype = std.mem.readInt(u32, bytes[off..][0..4], .big);
+        const slice_off: u64 = if (is_64)
+            std.mem.readInt(u64, bytes[off + 8 ..][0..8], .big)
+        else
+            std.mem.readInt(u32, bytes[off + 8 ..][0..4], .big);
+        const slice_sz: u64 = if (is_64)
+            std.mem.readInt(u64, bytes[off + 16 ..][0..8], .big)
+        else
+            std.mem.readInt(u32, bytes[off + 12 ..][0..4], .big);
+
+        if (slice_off >= 8 and slice_sz > 0) {
+            const slice_end = std.math.add(u64, slice_off, slice_sz) catch continue;
+            if (slice_end <= bytes.len) {
+                const sub = bytes[@intCast(slice_off)..@intCast(slice_end)];
+                if (first_slice == null) first_slice = sub;
+                if (cputype == CPU_TYPE_ARM64 and arm64_slice == null) arm64_slice = sub;
+            }
+        }
+    }
+    return arm64_slice orelse first_slice orelse bytes;
+}
+
 pub fn parseMachO(allocator: std.mem.Allocator, bytes: []const u8) !MachoImage {
     if (bytes.len < 32) return error.InvalidMachO;
     const magic = try readU32(bytes, 0);
@@ -64,7 +107,7 @@ pub fn parseMachO(allocator: std.mem.Allocator, bytes: []const u8) !MachoImage {
     const cpusubtype = try readU32(bytes, 8);
     const ncmds = try readU32(bytes, 16);
     const sizeofcmds = try readU32(bytes, 20);
-    if (32 + @as(usize, sizeofcmds) > bytes.len) return error.InvalidMachO;
+    if (@as(u64, 32) + @as(u64, sizeofcmds) > bytes.len) return error.InvalidMachO;
 
     const machine: pe.Machine = switch (cputype) {
         CPU_TYPE_ARM64 => .arm64,
@@ -94,7 +137,7 @@ pub fn parseMachO(allocator: std.mem.Allocator, bytes: []const u8) !MachoImage {
         if (cmd_off + 8 > bytes.len) break;
         const cmd = try readU32(bytes, cmd_off);
         const cmdsize = try readU32(bytes, cmd_off + 4);
-        if (cmdsize < 8 or cmd_off + cmdsize > bytes.len) break;
+        if (cmdsize < 8 or cmdsize > bytes.len - cmd_off) break;
 
         if (cmd == LC_SEGMENT_64 and cmdsize >= 72) {
             const segname = bytes[cmd_off + 8 .. cmd_off + 24];
@@ -158,7 +201,9 @@ pub fn parseMachO(allocator: std.mem.Allocator, bytes: []const u8) !MachoImage {
             const nsyms = try readU32(bytes, cmd_off + 12);
             const stroff = try readU32(bytes, cmd_off + 16);
             const strsize = try readU32(bytes, cmd_off + 20);
-            if (@as(usize, stroff) +| strsize <= bytes.len and @as(usize, symoff) +| @as(usize, nsyms) *| 16 <= bytes.len) {
+            const str_end = @as(u64, stroff) + @as(u64, strsize);
+            const sym_end = @as(u64, symoff) + @as(u64, nsyms) * 16;
+            if (str_end <= bytes.len and sym_end <= bytes.len) {
                 for (0..nsyms) |si| {
                     const nl = @as(usize, symoff) + si * 16;
                     const strx = try readU32(bytes, nl);
@@ -166,7 +211,7 @@ pub fn parseMachO(allocator: std.mem.Allocator, bytes: []const u8) !MachoImage {
                     const n_value = try readU64(bytes, nl + 8);
                     // External defined symbol (N_EXT=0x01, N_SECT=0x0E)
                     if ((n_type & 0x0F) == 0x0F and n_value >= text_base_vm and strx < strsize) {
-                        const srest = bytes[@as(usize, stroff) + strx .. @as(usize, stroff) + strsize];
+                        const srest = bytes[@as(usize, stroff) + strx .. @as(usize, @intCast(str_end))];
                         const nul = std.mem.indexOfScalar(u8, srest, 0) orelse srest.len;
                         if (nul > 0) {
                             const rva: u32 = @intCast(@min(n_value - text_base_vm, std.math.maxInt(u32)));
@@ -187,8 +232,9 @@ pub fn parseMachO(allocator: std.mem.Allocator, bytes: []const u8) !MachoImage {
         cmd_off += cmdsize;
     }
 
-    if (fn_starts_off != 0 and fn_starts_sz != 0 and @as(usize, fn_starts_off) +| fn_starts_sz <= bytes.len) {
-        const fs = bytes[fn_starts_off .. fn_starts_off + fn_starts_sz];
+    const fn_end = @as(u64, fn_starts_off) + @as(u64, fn_starts_sz);
+    if (fn_starts_off != 0 and fn_starts_sz != 0 and fn_end <= bytes.len) {
+        const fs = bytes[@as(usize, fn_starts_off)..@as(usize, @intCast(fn_end))];
         var pos: usize = 0;
         var cur: u64 = 0;
         var starts = std.ArrayList(u32).empty;

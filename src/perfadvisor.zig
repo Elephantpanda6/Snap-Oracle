@@ -1,5 +1,6 @@
 const std = @import("std");
 const binary = @import("binary.zig");
+const macho = @import("macho_arm64.zig");
 const pe = @import("pe.zig");
 const cfg = @import("cfg.zig");
 const arm64_isa = @import("arm64_isa.zig");
@@ -49,6 +50,9 @@ pub const PerfReport = struct {
     hot_funcs: []FuncPerfStats,
 
     pub fn deinit(self: *PerfReport) void {
+        for (self.hot_funcs) |hf| {
+            self.allocator.free(hf.name);
+        }
         self.allocator.free(self.hot_funcs);
     }
 };
@@ -75,10 +79,11 @@ fn isMlComputeSymbol(name: []const u8) bool {
 pub fn analyzePerformance(
     allocator: std.mem.Allocator,
     path: []const u8,
-    bytes: []const u8,
+    raw_bytes: []const u8,
     profile_query: ?[]const u8,
     out_fs: *finding.FindingSet,
 ) !PerfReport {
+    const bytes = macho.unwrapFatSlice(raw_bytes);
     var img = try binary.parseBinary(allocator, bytes);
     defer img.deinit();
 
@@ -114,15 +119,19 @@ pub fn analyzePerformance(
     const text_sec = img.findCodeSection() orelse {
         return rep;
     };
-    if (@as(u64, text_sec.raw_offset) + text_sec.raw_size > bytes.len or text_sec.raw_size == 0) {
+    const sec_end = @as(u64, text_sec.raw_offset) + @as(u64, text_sec.raw_size);
+    if (sec_end > bytes.len or text_sec.raw_size == 0) {
         return rep;
     }
-    const code = bytes[text_sec.raw_offset .. text_sec.raw_offset + text_sec.raw_size];
+    const code = bytes[@as(usize, text_sec.raw_offset)..@as(usize, @intCast(sec_end))];
     const base_rva = text_sec.virtual_address;
     const end_rva = base_rva +| @as(u32, @intCast(code.len));
 
     var func_stats = std.ArrayList(FuncPerfStats).empty;
-    errdefer func_stats.deinit(allocator);
+    errdefer {
+        for (func_stats.items) |hf| allocator.free(hf.name);
+        func_stats.deinit(allocator);
+    }
 
     if (img.isArm64()) {
         var fallback: [1]pe.RuntimeFunction = undefined;
@@ -230,6 +239,8 @@ pub fn analyzePerformance(
             }
 
             if (st.total_insns > 0) {
+                st.name = try allocator.dupe(u8, res.name);
+                errdefer allocator.free(st.name);
                 try func_stats.append(allocator, st);
             }
         }

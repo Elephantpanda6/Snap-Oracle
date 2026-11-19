@@ -88,6 +88,15 @@ pub fn buildCoverageReport(
     var recs = try allocator.alloc(BlockRecord, blocks.len);
     errdefer allocator.free(recs);
 
+    var fn_end_map = std.AutoHashMap(u32, u32).init(allocator);
+    defer fn_end_map.deinit();
+    for (img.functions) |f| {
+        const gop = try fn_end_map.getOrPut(f.begin_rva);
+        if (!gop.found_existing or f.end_rva > gop.value_ptr.*) {
+            gop.value_ptr.* = f.end_rva;
+        }
+    }
+
     var fn_map = std.AutoHashMap(u32, struct { total: usize, hit: usize }).init(allocator);
     defer fn_map.deinit();
 
@@ -95,10 +104,19 @@ pub fn buildCoverageReport(
         const bb = blocks[orig_i];
         const hit_cnt = if (orig_i < hits.len) hits[orig_i] else 0;
         var bsz: u16 = 4;
+        var has_next_in_fn = false;
         if (pos + 1 < idx_buf.len) {
             const next_bb = blocks[idx_buf[pos + 1]];
             if (next_bb.func_rva == bb.func_rva and next_bb.rva > bb.rva) {
                 bsz = @intCast(@min(next_bb.rva - bb.rva, 4096));
+                has_next_in_fn = true;
+            }
+        }
+        if (!has_next_in_fn) {
+            if (fn_end_map.get(bb.func_rva)) |fn_end| {
+                if (fn_end > bb.rva) {
+                    bsz = @intCast(@min(fn_end - bb.rva, 4096));
+                }
             }
         }
         recs[pos] = .{
@@ -175,7 +193,7 @@ fn renderDrCov(allocator: std.mem.Allocator, rep: *const CovReport) ![]u8 {
     errdefer out.deinit(allocator);
 
     const hdr = try std.fmt.allocPrint(allocator,
-        "DRCOV VERSION: 2\nDRCOV FLAVOR: snap-oracle\nModule Table: version 2, count 1\nColumns: id, base, end, entry, checksum, timestamp, path\n0, 0x{x}, 0x{x}, 0x{x}, 0x0, 0x0, {s}\nBB Table: {d} bbs\n",
+        "DRCOV VERSION: 2\nDRCOV FLAVOR: snap-oracle\nModule Table: version 2, count 1\nColumns: id, base, end, entry, checksum, timestamp, path\n0, 0x{x:0>16}, 0x{x:0>16}, 0x{x:0>16}, 0x0, 0x0, {s}\nBB Table: {d} bbs\n",
         .{ rep.image_base, end_addr, entry_addr, rep.artifact, covered_cnt },
     );
     defer allocator.free(hdr);
@@ -193,25 +211,40 @@ fn renderDrCov(allocator: std.mem.Allocator, rep: *const CovReport) ![]u8 {
     return out.toOwnedSlice(allocator);
 }
 
+fn appendLcovSanitized(list: *std.ArrayList(u8), allocator: std.mem.Allocator, name: []const u8) !void {
+    for (name) |c| {
+        switch (c) {
+            ',', '\r', '\n' => try list.append(allocator, '_'),
+            else => try list.append(allocator, c),
+        }
+    }
+}
+
 fn renderLcov(allocator: std.mem.Allocator, rep: *const CovReport) ![]u8 {
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
 
-    const sf = try std.fmt.allocPrint(allocator, "TN:snap-oracle\nSF:{s}\n", .{rep.artifact});
-    defer allocator.free(sf);
-    try out.appendSlice(allocator, sf);
+    try out.appendSlice(allocator, "TN:snap-oracle\nSF:");
+    for (rep.artifact) |c| {
+        try out.append(allocator, if (c == '\r' or c == '\n') '_' else c);
+    }
+    try out.append(allocator, '\n');
 
     var fn_hit: usize = 0;
     for (rep.functions, 1..) |f, ord| {
-        const fn_line = try std.fmt.allocPrint(allocator, "FN:{d},{s}\n", .{ ord, f.name });
-        defer allocator.free(fn_line);
-        try out.appendSlice(allocator, fn_line);
+        const fn_prefix = try std.fmt.allocPrint(allocator, "FN:{d},", .{ord});
+        defer allocator.free(fn_prefix);
+        try out.appendSlice(allocator, fn_prefix);
+        try appendLcovSanitized(&out, allocator, f.name);
+        try out.append(allocator, '\n');
         if (f.hit_blocks > 0) fn_hit += 1;
     }
     for (rep.functions) |f| {
-        const fnda = try std.fmt.allocPrint(allocator, "FNDA:{d},{s}\n", .{ f.hit_blocks, f.name });
-        defer allocator.free(fnda);
-        try out.appendSlice(allocator, fnda);
+        const fnda_prefix = try std.fmt.allocPrint(allocator, "FNDA:{d},", .{f.hit_blocks});
+        defer allocator.free(fnda_prefix);
+        try out.appendSlice(allocator, fnda_prefix);
+        try appendLcovSanitized(&out, allocator, f.name);
+        try out.append(allocator, '\n');
     }
     const fsum = try std.fmt.allocPrint(allocator, "FNF:{d}\nFNH:{d}\n", .{ rep.functions.len, fn_hit });
     defer allocator.free(fsum);
@@ -477,8 +510,9 @@ pub fn runCovCommand(io: std.Io, allocator: std.mem.Allocator, args: []const []c
                 armed[bi] = bp_table.orig_bytes.contains(loaded.base_addr + @as(usize, bb.rva));
             }
             veh.setBreakpointTable(&bp_table);
-            @memcpy(arena.live_ptr[0..data.len], data);
-            _ = veh.runProtected(loaded.entry, arena.live_ptr, data.len);
+            const run_len = @min(data.len, arena.size);
+            if (run_len > 0) @memcpy(arena.live_ptr[0..run_len], data[0..run_len]);
+            _ = veh.runProtected(loaded.entry, arena.live_ptr, run_len);
             _ = arena.restoreDirtyPages() catch 0;
             _ = mod_snap.restore();
 

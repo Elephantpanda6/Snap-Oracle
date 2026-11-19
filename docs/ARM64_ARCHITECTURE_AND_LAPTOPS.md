@@ -22,7 +22,7 @@ Yet security tooling, binary fuzzers, and ABI verification tools still lag behin
 
 | Profile ID (`--laptop`) | SoC / Microarchitecture | ISA & Security Extensions | Page / Cache | Recommended Tuning | Target Use Cases |
 |---|---|---|---|---|---|
-| `snapdragon-x-elite` | 12x Qualcomm Oryon Gen 1 | ARMv8.7-A, LSE, PAC, BF16/I8MM (No SVE2/SME) | 4 KB / 64 B | 10 workers, 64 KiB arena, mask `0x0FFF` | Copilot+ Windows DLL fuzzing, ARM64EC verification, enterprise VPN/codec auditing |
+| `snapdragon-x-elite` | 12x Qualcomm Oryon Gen 1 | ARMv8.7-A, LSE, PAC, BF16/I8MM (No SVE2/SME) | 4 KB / 64 B | 10 workers, 64 KiB arena, mask `0x0FFF` | Copilot+ Windows DLL fuzzing, ARM64EC verification, VPN/codec auditing |
 | `snapdragon-x-plus` | 8x–10x Qualcomm Oryon Gen 1 | ARMv8.7-A, LSE, PAC | 4 KB / 64 B | 6 workers, 64 KiB arena, mask `0x00FF` | Lightweight on-device Windows ARM64 CI & regression triage |
 | `snapdragon-x2-elite` | 12x–18x Oryon Gen 2/3 | ARMv9.2-A, LSE, PAC, BTI, MTE, SVE2, SME | 4 KB / 64 B | 12 workers, 128 KiB arena, `--bti-safe` | High-throughput Windows ARMv9 fuzzing with BTI-protected targets |
 | `nvidia-n1x-spark` | 10x Cortex-X925 + 10x A725 + Blackwell UMA | ARMv9.2-A, LSE, PAC, BTI, MTE, SVE2 | 4 KB / 64 B | 10 P-core workers (`0x03FF`), 256 KiB arena | Fuzzing multi-MB GGUF/ONNX AI parsers & CUDA/NPU drivers inside 128 GB UMA |
@@ -56,9 +56,9 @@ Yet security tooling, binary fuzzers, and ABI verification tools still lag behin
 3. **Hyper-V / KVM L2 Micro-VM Fallback**: Wrap targets that spawn child threads or kernel handles inside a lightweight Hyper-V / KVM snapshot loop while keeping L1 in-process speed (`150k–700k exec/s`) for pure parser targets.
 4. **ARM64EC Thunk & Guest-Exit Tracer**: Inspects `CHPEMetadataPointer` and `#`-prefixed ARM64EC decorated thunks in `src/imports.zig` alongside `pe.zig` `.a64xrm` detection.
 
-## Enterprise Commercial & DevSecOps Modules (Added in v0.3.0-enterprise-arm64)
+## ARM64 Compliance, Porting & Analysis Modules (Added in v0.3.0-arm64)
 
-| Module | CLI Subcommand | Commercial Enterprise Purpose |
+| Module | CLI Subcommand | Purpose |
 |---|---|---|
 | `src/finding.zig` + `src/report.zig` | `report`, `--format sarif\|json\|junit\|gha` | GitHub Code Scanning SARIF 2.1.0, Jenkins JUnit, deterministic FNV-1a finding fingerprints |
 | `src/imports.zig` | `deps` | PE/ARM64EC/ELF/Mach-O dependency closure & mixed-arch loadability check (`SO-DEP-001`..`004`) |
@@ -75,4 +75,4 @@ Yet security tooling, binary fuzzers, and ABI verification tools still lag behin
 | `src/bench.zig` | `bench` | Hardware fleet microbenchmarks (`decode`, `cfg`, `mutate`, `snapshot`, `exec`) with median/p95/MAD regression gate |
 | `src/crashdb.zig` | `crashdb`, `baseline` | CRC32-verified persistent JSONL database & legacy finding suppression (`--baseline`) |
 | `src/ci_gate.zig` | `ci init\|gate` | Native ARM64 CI workflow templates & expiring ISO-date waiver policy enforcement |
-| `src/license.zig` | `license` | Offline Ed25519 commercial license verification + authorized-use & non-liability enforcement |
+| `src/license.zig` | `license` | Offline Ed25519 license verification + authorized-use & non-liability summary |
